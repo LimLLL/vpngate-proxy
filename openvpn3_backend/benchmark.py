@@ -92,10 +92,13 @@ def _connect_cli(index: int, profile: str, connection: CLIConnection) -> dict[st
         raise RuntimeError(f"tun{index}: {diagnostic}") from exc
 
 
-def cli_connected(profiles: Sequence[Path]) -> tuple[list[CLIConnection], dict[str, Any]]:
+def cli_connected(profiles: Sequence[Path], log_dir: Path) -> tuple[list[CLIConnection], dict[str, Any]]:
     started = time.monotonic()
     connections = [
-        CLIConnection(path.read_text(encoding="utf-8"), connect_timeout=20, device=f"tun{index}")
+        CLIConnection(
+            path.read_text(encoding="utf-8"), connect_timeout=20,
+            device=f"tun{index}", log_path=log_dir / f"cli-{index}.log",
+        )
         for index, path in enumerate(profiles)
     ]
     report = base_report("openvpn2-cli", len(connections))
@@ -151,11 +154,12 @@ def base_report(backend: str, count: int) -> dict[str, Any]:
         "engine_process_count": count if backend == "openvpn2-cli" else 1,
         "sessions": [],
         "errors": [],
+        "testbed_errors": [],
     }
 
 
-def run_cli(profiles: Sequence[Path], testbed: Testbed) -> dict[str, Any]:
-    connections, report = cli_connected(profiles)
+def run_cli(profiles: Sequence[Path], testbed: Testbed, case_dir: Path) -> dict[str, Any]:
+    connections, report = cli_connected(profiles, case_dir)
     errors: list[str] = []
     try:
         report["interface_checks"] = traffic_check(len(connections), testbed.target_url, testbed.expected_body)
@@ -248,57 +252,58 @@ def main() -> None:
 
     workdir = args.workdir
     workdir.mkdir(parents=True, exist_ok=True)
-    version = subprocess.run(["openvpn", "--version"], check=True, capture_output=True, text=True, timeout=5)
-    with local_testbed(workdir, max(args.concurrency)) as testbed:
-        profile_paths = testbed.profiles
-        labels = [f"vpngate-benchmark-client{index}" for index in range(len(profile_paths))]
-        print(f"Controlled testbed: {testbed.target_url}", flush=True)
-        results: list[dict[str, Any]] = []
-        failures = False
-        for count in args.concurrency:
-            selected = profile_paths[:count]
-            for backend in ("go", "cli"):
-                case_dir = workdir / f"{backend}-{count}"
-                case_dir.mkdir(exist_ok=True)
-                print(f"START {backend} with {count} tunnel(s)", flush=True)
-                try:
+    results: list[dict[str, Any]] = []
+    failures = False
+    for count in args.concurrency:
+        for backend in ("go", "cli"):
+            case_dir = workdir / f"{backend}-{count}"
+            case_dir.mkdir(exist_ok=True)
+            report = base_report("go-openvpn3-core" if backend == "go" else "openvpn2-cli", count)
+            try:
+                # A fresh server per case avoids OpenVPN's five-second CC-EEN
+                # delayed exit and old UDP peers contaminating later cases.
+                with local_testbed(case_dir, count) as testbed:
+                    selected = testbed.profiles[:count]
+                    print(f"START {backend} with {count} tunnel(s)", flush=True)
                     if backend == "go":
                         report = run_go(selected, case_dir, args.go_binary, testbed)
                     else:
-                        report = run_cli(selected, testbed)
+                        report = run_cli(selected, testbed, case_dir)
+                        version = subprocess.run(
+                            ["openvpn", "--version"], check=True,
+                            capture_output=True, text=True, timeout=5,
+                        )
                         report["openvpn_version"] = version.stdout.splitlines()[0]
-                    report["profile_nodes"] = labels[:count]
+                    report["profile_nodes"] = [path.stem for path in selected]
+                    report["testbed_capacity"] = testbed.server_capacity
                     report["measurement_note"] = (
                         "One controlled local run; real TLS/TUN without public RTT; "
                         "no statistical or throughput conclusion"
                     )
-                except Exception as exc:
-                    report_file = case_dir / "report.json"
-                    report = base_report("go-openvpn3-core" if backend == "go" else "openvpn2-cli", count)
-                    if backend == "go" and report_file.exists():
-                        report = json.loads(report_file.read_text(encoding="utf-8"))
-                    report["stage"] = "failed"
-                    report.setdefault("errors", []).append(str(exc))
-                    failures = True
-                write_json(case_dir / "final.json", report)
-                results.append(report)
-                print(json.dumps({
-                    "backend": backend, "count": count, "stage": report["stage"],
-                    "wall_ready_ms": report.get("wall_ready_ms"),
-                    "max_ready_ms": report.get("max_ready_ms"),
-                    "current_rss_kb_after_connect": report.get("current_rss_kb_after_connect"),
-                    "peak_rss_kb": report.get("peak_rss_kb"),
-                    "threads_after_connect": report.get("threads_after_connect"),
-                    "engine_process_count": report.get("engine_process_count"),
-                    "errors": report.get("errors"),
-                }, ensure_ascii=False), flush=True)
+            except Exception as exc:
+                report["stage"] = "failed"
+                report["testbed_errors"].append(str(exc))
+                failures = True
+            if report["stage"] == "failed":
+                failures = True
+            write_json(case_dir / "final.json", report)
+            results.append(report)
+            print(json.dumps({
+                "backend": backend, "count": count, "stage": report["stage"],
+                "wall_ready_ms": report.get("wall_ready_ms"),
+                "max_ready_ms": report.get("max_ready_ms"),
+                "current_rss_kb_after_connect": report.get("current_rss_kb_after_connect"),
+                "peak_rss_kb": report.get("peak_rss_kb"),
+                "threads_after_connect": report.get("threads_after_connect"),
+                "engine_process_count": report.get("engine_process_count"),
+                "errors": report.get("errors"),
+                "testbed_errors": report.get("testbed_errors"),
+            }, ensure_ascii=False), flush=True)
 
-        write_json(workdir / "comparison.json", {
-            "mode": "runner-local-openvpn-server",
-            "target_url": testbed.target_url,
-            "nodes": labels,
-            "results": results,
-        })
+    write_json(workdir / "comparison.json", {
+        "mode": "controlled-servers-one-per-case",
+        "results": results,
+    })
     if failures:
         raise SystemExit("At least one benchmark failed; inspect final.json, server logs and go.log artifacts")
 

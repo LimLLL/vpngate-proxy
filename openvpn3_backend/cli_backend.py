@@ -25,6 +25,7 @@ class CLIConnection:
         password: str = "vpn",
         connect_timeout: int = 30,
         device: str | None = None,
+        log_path: Path | None = None,
     ) -> None:
         if connect_timeout < 1:
             raise ValueError("connect_timeout must be positive")
@@ -34,6 +35,7 @@ class CLIConnection:
         self._username = username
         self._password = password
         self._workspace = Path(tempfile.mkdtemp(prefix="vpngate-cli-"))
+        self.log_path = log_path
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
         self._connected = threading.Event()
@@ -167,6 +169,8 @@ class CLIConnection:
                 self._reader.join(min(timeout, 2))
         finally:
             self.shutdown_ms = (time.monotonic() - started) * 1000
+            if self.log_path:
+                self.log_path.write_text("\n".join(self.logs) + "\n", encoding="utf-8")
             shutil.rmtree(self._workspace, ignore_errors=True)
 
     def __enter__(self) -> CLIConnection:

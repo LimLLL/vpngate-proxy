@@ -19,6 +19,7 @@ class Testbed:
     profiles: tuple[Path, ...]
     target_url: str
     expected_body: str
+    server_capacity: int
 
 
 def stop_process(process: subprocess.Popen[str]) -> None:
@@ -33,7 +34,12 @@ def stop_process(process: subprocess.Popen[str]) -> None:
         raise TimeoutError("Local test server required SIGKILL during cleanup")
 
 
-def cleanup_network(namespace: str, physical_link: str, processes: list[subprocess.Popen[str]]) -> None:
+def cleanup_network(
+    namespace: str,
+    physical_link: str,
+    processes: list[subprocess.Popen[str]],
+    veth_created: bool,
+) -> None:
     """Remove only the namespace and veth pair owned by this fixture."""
     errors: list[str] = []
     for process in processes:
@@ -56,7 +62,7 @@ def cleanup_network(namespace: str, physical_link: str, processes: list[subproce
         subprocess.run(["ip", "netns", "del", namespace], check=True, capture_output=True, timeout=5)
         # Deleting the namespace can also delete the virtual veth pair, unlike
         # a physical NIC moved back to the root namespace.
-        if Path(f"/sys/class/net/{physical_link}").exists():
+        if veth_created and Path(f"/sys/class/net/{physical_link}").exists():
             result = subprocess.run(
                 ["ip", "link", "delete", physical_link], capture_output=True, text=True, timeout=5,
             )
@@ -149,7 +155,7 @@ key {private / 'server.key'}
 tls-crypt {tls_key}
 script-security 2
 auth-user-pass-verify {auth_script} via-file
-max-clients 4
+max-clients {maximum * 2 + 8}
 keepalive 10 120
 persist-tun
 verb 3
@@ -191,21 +197,23 @@ remote-cert-tls server
     server: subprocess.Popen[str] | None = None
     web: subprocess.Popen[str] | None = None
     namespace_created = False
+    veth_created = False
     with console_log.open("w", encoding="utf-8") as console:
         try:
             subprocess.run(["ip", "netns", "add", namespace], check=True, capture_output=True, timeout=5)
             namespace_created = True
             network_commands = [
                 ["ip", "link", "add", physical_link, "type", "veth", "peer", "name", namespace_link],
-                ["ip", "link", "set", namespace_link, "netns", namespace],
                 ["ip", "address", "add", "192.0.2.1/30", "dev", physical_link],
                 ["ip", "link", "set", physical_link, "up"],
                 ["ip", "netns", "exec", namespace, "ip", "link", "set", "lo", "up"],
                 ["ip", "netns", "exec", namespace, "ip", "address", "add", "192.0.2.2/30", "dev", namespace_link],
                 ["ip", "netns", "exec", namespace, "ip", "link", "set", namespace_link, "up"],
             ]
-            for command in network_commands:
+            network_commands.insert(1, ["ip", "link", "set", namespace_link, "netns", namespace])
+            for index, command in enumerate(network_commands):
                 subprocess.run(command, check=True, capture_output=True, timeout=5)
+                veth_created = index >= 1
             server = subprocess.Popen(
                 ["ip", "netns", "exec", namespace, "openvpn", "--config", str(server_config)],
                 stdout=console, stderr=subprocess.STDOUT, text=True,
@@ -230,11 +238,14 @@ remote-cert-tls server
                 time.sleep(0.1)
             else:
                 raise TimeoutError("Local HTTP endpoint is not listening in the server namespace")
-            yield Testbed(tuple(profiles), f"http://{server_ip}:{http_port}/health.txt", "vpngate-tunnel-ok")
+            yield Testbed(
+                tuple(profiles), f"http://{server_ip}:{http_port}/health.txt", "vpngate-tunnel-ok",
+                maximum * 2 + 8,
+            )
         finally:
             if namespace_created:
                 processes = [process for process in (web, server) if process is not None]
-                cleanup_network(namespace, physical_link, processes)
+                cleanup_network(namespace, physical_link, processes, veth_created)
 
 
 

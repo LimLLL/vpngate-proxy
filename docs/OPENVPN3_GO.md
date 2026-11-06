@@ -42,7 +42,7 @@ GitHub Actions run `42195536699` 对同一个 VPNGate 节点完成了 Go/C++ Cor
 
 `openvpn3-benchmark.yml` 使用仅存在于本次 Action job 的受控 OpenVPN 服务端，隔离公网节点的可达性和匿名认证波动。服务端与 HTTP 验证点运行在独立的 Linux network namespace；客户端在主网络命名空间分别通过真实 TLS、PKI 证书、账号密码认证和 UDP 隧道连接。客户端到虚拟 HTTP 地址的流量必须穿过它自己的 TUN，不能直接命中主机的 local 路由。
 
-测试使用不同客户端证书和独立的 `tunN`，服务端 `max-clients 4` 明确允许并发。PKI、账号检查脚本、namespace 和 veth 均由测试现场自动创建、清理，不影响项目默认的 CLI 代理功能，也不在用户 Mac 上执行。
+测试使用不同客户端证书和独立的 `tunN`。每个 case 使用全新服务端，避免 OpenVPN 2.x 收到 Core 退出消息后等待约五秒确认 ACK 时，将旧客户端残留状态带入下一轮。每个 case 也使用独立日志目录；PKI、账号检查脚本、namespace 和 veth 均由测试自动创建、清理，不在用户 Mac 上运行。
 
 此前的公网配对测试同时观察到了单隧道成功及同一节点偶发 `AUTH_FAILED`。SoftEther 的服务端可以限制同一用户的并发登录数，但客户端无法据此断定具体志愿者节点的拒绝原因；因此公网可用性保留在 `openvpn3-go.yml`，性能基准改用上述受控环境。
 

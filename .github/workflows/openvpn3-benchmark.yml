@@ -78,7 +78,7 @@ jobs:
           results="${RUNNER_TEMP}/vpngate-benchmark"
           if test -d "${results}"; then
             sudo chmod -R a+rX "${results}"
-            for log_file in "${results}"/go-*/go.log "${results}"/server.log "${results}"/server-console.log; do
+            for log_file in "${results}"/go-*/go.log "${results}"/cli-*/cli-*.log; do
               if test -f "${log_file}"; then
                 printf '\n===== %s =====\n' "${log_file}"
                 cat "${log_file}"
