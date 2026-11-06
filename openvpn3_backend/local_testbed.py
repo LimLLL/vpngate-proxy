@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import signal
-import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -209,17 +208,19 @@ remote-cert-tls server
                 cwd=private / "web", stdout=console, stderr=subprocess.STDOUT, text=True,
             )
             for _ in range(50):
-                try:
-                    with socket.create_connection((server_ip, http_port), timeout=0.2):
-                        break
-                except OSError:
-                    if server.poll() is not None:
-                        raise RuntimeError("Local OpenVPN server exited before clients started")
-                    if web.poll() is not None:
-                        raise RuntimeError("Local HTTP endpoint exited before clients started")
-                    time.sleep(0.1)
+                result = subprocess.run(
+                    ["ip", "netns", "exec", namespace, "ss", "-H", "-ltn"],
+                    check=True, capture_output=True, text=True, timeout=5,
+                )
+                if f"{server_ip}:{http_port}" in result.stdout:
+                    break
+                if server.poll() is not None:
+                    raise RuntimeError("Local OpenVPN server exited before clients started")
+                if web.poll() is not None:
+                    raise RuntimeError("Local HTTP endpoint exited before clients started")
+                time.sleep(0.1)
             else:
-                raise TimeoutError("Local HTTP test endpoint did not start")
+                raise TimeoutError("Local HTTP endpoint is not listening in the server namespace")
             yield Testbed(tuple(profiles), f"http://{server_ip}:{http_port}/health.txt", "vpngate-tunnel-ok")
         finally:
             if namespace_created:
