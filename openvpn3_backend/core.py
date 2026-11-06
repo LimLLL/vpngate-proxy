@@ -227,27 +227,31 @@ class VPNConnection:
             if event.fatal:
                 self._fatal_error = f"{event.name}: {event.info}"
         if event_name == "CONNECTED":
-            print(f"[core-callback {threading.get_native_id()}] before connection_info", flush=True)
-            native_info = self._client.connection_info()
-            print(f"[core-callback {threading.get_native_id()}] after connection_info", flush=True)
-            with self._state_lock:
-                self._connection_info = {
-                    key: str(getattr(native_info, key))
-                    for key in (
-                        "serverHost",
-                        "serverPort",
-                        "serverProto",
-                        "serverIp",
-                        "vpnIp4",
-                        "vpnIp6",
-                        "vpnMtu",
-                        "gw4",
-                        "gw6",
-                        "tunName",
-                    )
-                }
             self._connected.set()
         print(f"[core-callback {threading.get_native_id()}] event exit {event_name}", flush=True)
+
+    def _refresh_connection_info(self) -> None:
+        # ClientAPI specifies this call for after CONNECTED, not during a
+        # native director callback. Calling it here avoids C++/Python reentry.
+        native_info = self._client.connection_info()
+        if not native_info.defined:
+            raise OpenVPN3Error("Native CONNECTED event has no connection information")
+        with self._state_lock:
+            self._connection_info = {
+                key: str(getattr(native_info, key))
+                for key in (
+                    "serverHost",
+                    "serverPort",
+                    "serverProto",
+                    "serverIp",
+                    "vpnIp4",
+                    "vpnIp6",
+                    "vpnMtu",
+                    "gw4",
+                    "gw6",
+                    "tunName",
+                )
+            }
 
     def _on_acc_event(self, event: Any) -> None:
         with self._state_lock:
@@ -263,6 +267,7 @@ class VPNConnection:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._connected.wait(0.2):
+                self._refresh_connection_info()
                 return self.connection_info
             self._raise_if_failed()
         raise TimeoutError(f"OpenVPN 3 Core did not connect within {timeout:g}s")
