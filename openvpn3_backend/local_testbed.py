@@ -67,7 +67,11 @@ def cleanup_network(
                 ["ip", "link", "delete", physical_link], capture_output=True, text=True, timeout=5,
             )
             if result.returncode != 0:
-                errors.append(f"Remove veth {physical_link}: {result.stderr.strip()}")
+                diagnostic = (result.stderr + "\n" + result.stdout).lower()
+                # The object may race from this name to a generated pending
+                # delete name between the check and iproute2's netlink call.
+                if "cannot find device" not in diagnostic and "no such device" not in diagnostic:
+                    errors.append(f"Remove veth {physical_link}: {result.stderr.strip()}")
     except Exception as exc:
         errors.append(str(exc))
     if errors:

@@ -276,6 +276,7 @@ def main() -> None:
                         report["openvpn_version"] = version.stdout.splitlines()[0]
                     report["profile_nodes"] = [path.stem for path in selected]
                     report["testbed_capacity"] = testbed.server_capacity
+                    report.setdefault("testbed_errors", [])
                     report["measurement_note"] = (
                         "One controlled local run; real TLS/TUN without public RTT; "
                         "no statistical or throughput conclusion"
