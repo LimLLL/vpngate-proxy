@@ -13,8 +13,11 @@ def main() -> None:
     if len(credentials) != 2 or username != "vpn" or credentials != ["vpn", "vpn"]:
         raise SystemExit("Benchmark username/password verification failed")
 
-    event = {"username": username, "common_name": os.environ.get("common_name", "")}
-    with Path(os.environ["VPNGATE_AUTH_LOG"]).open("a", encoding="utf-8") as log:
+    event = {"username": username, "common_name": os.environ["common_name"]}
+    # OpenVPN invokes this script with a sanitized environment. The script's
+    # destination inside the private per-run directory needs no custom env.
+    audit_log = Path(__file__).with_name("auth.jsonl")
+    with audit_log.open("a", encoding="utf-8") as log:
         log.write(json.dumps(event) + "\n")
 
 

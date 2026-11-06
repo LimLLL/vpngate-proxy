@@ -118,7 +118,6 @@ def local_testbed(workdir: Path, maximum: int) -> Iterator[Testbed]:
 
     tls_key = private / "tls-crypt.key"
     subprocess.run(["openvpn", "--genkey", "secret", str(tls_key)], check=True, capture_output=True, timeout=20)
-    auth_log = workdir / "auth.jsonl"
     server_log = workdir / "server.log"
     console_log = workdir / "server-console.log"
     script = Path(__file__).with_name("local_auth.py")
@@ -191,8 +190,6 @@ remote-cert-tls server
 
     server: subprocess.Popen[str] | None = None
     web: subprocess.Popen[str] | None = None
-    environment = os.environ.copy()
-    environment["VPNGATE_AUTH_LOG"] = str(auth_log)
     namespace_created = False
     with console_log.open("w", encoding="utf-8") as console:
         try:
@@ -211,7 +208,7 @@ remote-cert-tls server
                 subprocess.run(command, check=True, capture_output=True, timeout=5)
             server = subprocess.Popen(
                 ["ip", "netns", "exec", namespace, "openvpn", "--config", str(server_config)],
-                env=environment, stdout=console, stderr=subprocess.STDOUT, text=True,
+                stdout=console, stderr=subprocess.STDOUT, text=True,
             )
             check_server(server, server_log)
             web = subprocess.Popen(
