@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -39,12 +40,13 @@ func run() (resultErr error) {
 		fmt.Printf("[go event] %+v\n", event)
 	}
 
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer closeCancel()
 	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer closeCancel()
 		stopped := time.Now()
-		if err := client.Close(closeCtx); err != nil && resultErr == nil {
-			resultErr = fmt.Errorf("close native connection: %w", err)
+		if err := client.Close(closeCtx); err != nil {
+			stopErr := fmt.Errorf("close native connection: %w", err)
+			resultErr = errors.Join(resultErr, stopErr)
 		}
 		fmt.Printf("stop_ms=%d\n", time.Since(stopped).Milliseconds())
 	}()

@@ -15,11 +15,6 @@ on:
         required: true
         default: false
         type: boolean
-      concurrency:
-        description: Concurrent tunnels after the basic connection succeeds
-        required: true
-        default: 1
-        type: number
 
 permissions:
   contents: read
@@ -74,9 +69,9 @@ jobs:
             --output "${RUNNER_TEMP}/candidate.ovpn" \
             --snapshot "${RUNNER_TEMP}/vpngate-live.csv" --device tun0
 
-      - name: Evaluate the real profile in Go without opening a tunnel
+      - name: Evaluate a real profile and verify failed-connection cleanup
         if: github.event_name == 'workflow_dispatch' && inputs.live_test
-        run: go test -race ./core -run TestRealVPNGateProfileEvalAndRelease -v
+        run: go test -race ./core -run 'Test(RealVPNGateProfileEvalAndRelease|FailedNativeConnectionCanBeClosed)$' -v
         working-directory: go_backend
         env:
           VPNGATE_TEST_PROFILE: ${{ runner.temp }}/candidate.ovpn

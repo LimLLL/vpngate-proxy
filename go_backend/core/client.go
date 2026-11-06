@@ -58,11 +58,12 @@ type Client struct {
 
 	events chan Event
 	Logs   chan string
-	done   chan error
+	done   chan struct{}
 
-	mu      sync.Mutex
-	started bool
-	closed  bool
+	mu         sync.Mutex
+	started    bool
+	closed     bool
+	connectErr error
 }
 
 var registry sync.Map
@@ -111,7 +112,7 @@ func NewClient(profile, username, password string, connectTimeout int) (*Client,
 		return nil, errors.New("failed to initialize the OpenVPN 3 Core client")
 	}
 	c := &Client{handle: handle, id: id, events: make(chan Event, 64),
-		Logs: make(chan string, 256), done: make(chan error, 1)}
+		Logs: make(chan string, 256), done: make(chan struct{})}
 	registry.Store(uint32(id), c)
 
 	profileC, userC, passwordC := C.CString(profile), C.CString(username), C.CString(password)
@@ -139,7 +140,11 @@ func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-		c.done <- statusError(C.vpn_client_connect(c.handle))
+		err := statusError(C.vpn_client_connect(c.handle))
+		c.mu.Lock()
+		c.connectErr = err
+		c.mu.Unlock()
+		close(c.done)
 	}()
 
 	for {
@@ -154,7 +159,10 @@ func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 			if event.Name == "CONNECTED" {
 				return c.ConnectionInfo()
 			}
-		case err := <-c.done:
+		case <-c.done:
+			c.mu.Lock()
+			err := c.connectErr
+			c.mu.Unlock()
 			if err == nil {
 				return ConnectionInfo{}, errors.New("native session ended before CONNECTED")
 			}
@@ -196,19 +204,24 @@ func (c *Client) Close(ctx context.Context) error {
 		c.closeUnstarted()
 		return nil
 	}
+	select {
+	case <-c.done:
+		c.closeUnstarted()
+		return nil
+	default:
+	}
 	if err := statusError(C.vpn_client_stop(c.handle)); err != nil {
 		return err
 	}
 	select {
-	case err := <-c.done:
-		if err != nil {
-			return err
-		}
+	case <-c.done:
+		// The connection's error is reported by Connect. Done means the
+		// handle can be freed even when that connection attempt failed.
+		c.closeUnstarted()
+		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("wait for native stop: %w", ctx.Err())
 	}
-	c.closeUnstarted()
-	return nil
 }
 
 func (c *Client) closeUnstarted() {
