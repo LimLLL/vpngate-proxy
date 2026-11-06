@@ -57,7 +57,7 @@ jobs:
         env:
           CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
 
-      - name: Measure 1, 2 and 4 concurrent tunnels on paired nodes
+      - name: Measure 1, 2 and 4 concurrent tunnels against a controlled server
         run: |
           case '${{ inputs.concurrency }}' in
             all) benchmark_args=(--concurrency 1 --concurrency 2 --concurrency 4) ;;
@@ -78,7 +78,7 @@ jobs:
           results="${RUNNER_TEMP}/vpngate-benchmark"
           if test -d "${results}"; then
             sudo chmod -R a+rX "${results}"
-            for log_file in "${results}"/go-*/go.log; do
+            for log_file in "${results}"/go-*/go.log "${results}"/server.log "${results}"/server-console.log; do
               if test -f "${log_file}"; then
                 printf '\n===== %s =====\n' "${log_file}"
                 cat "${log_file}"

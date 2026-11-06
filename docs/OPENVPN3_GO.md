@@ -40,9 +40,11 @@ GitHub Actions run `42195536699` 对同一个 VPNGate 节点完成了 Go/C++ Cor
 
 ## 并发与开销基准
 
-`openvpn3-benchmark.yml` 从同一份快照中选择 N 个预检通过的不同节点，在一个 Go 进程中嵌入 N 个 C++ Core 实例，与 N 个 OpenVPN 2.x CLI 进程对比。每种后端都使用相同编号、相同 profile 的节点，接口独立执行策略路由、绑定网卡的公网访问与出口 IP 检查。
+`openvpn3-benchmark.yml` 使用仅存在于本次 Action job 的受控 OpenVPN 服务端，隔离公网节点的可达性和匿名认证波动。服务端与 HTTP 验证点运行在独立的 Linux network namespace；客户端在主网络命名空间分别通过真实 TLS、PKI 证书、账号密码认证和 UDP 隧道连接。客户端到虚拟 HTTP 地址的流量必须穿过它自己的 TUN，不能直接命中主机的 local 路由。
 
-预检用临时 CLI 隧道验证候选握手，跳过认证失败等不健康节点；预检不计入基准耗时。这样避免同一公开 profile 的重复异步登录被志愿者服务器拒绝（`AUTH_FAILED`），影响并发引擎的对照。`duplicate-cn` 是服务端设置，无法由客户端任意打开，也不能据此承诺不同节点在测试期间始终可用。
+测试使用不同客户端证书和独立的 `tunN`，服务端 `max-clients 4` 明确允许并发。PKI、账号检查脚本、namespace 和 veth 均由测试现场自动创建、清理，不影响项目默认的 CLI 代理功能，也不在用户 Mac 上执行。
+
+此前的公网配对测试同时观察到了单隧道成功及同一节点偶发 `AUTH_FAILED`。SoftEther 的服务端可以限制同一用户的并发登录数，但客户端无法据此断定具体志愿者节点的拒绝原因；因此公网可用性保留在 `openvpn3-go.yml`，性能基准改用上述受控环境。
 
 ```bash
 gh workflow run openvpn3-benchmark.yml --repo LimLLL/vpngate-proxy -f concurrency=all
@@ -60,7 +62,7 @@ gh run watch --repo LimLLL/vpngate-proxy
 - 活跃 RSS、生命周期峰值 RSS；
 - 流量检查到停止前的引擎 CPU 累计时间。
 
-CLI 指标来自实际 OpenVPN 子进程 PID，而非 Python 编排器；其 CLI 连接计时仍包含 `--route-delay 2`。RSS/峰值对于多个 CLI 进程采用累加，可能重复计入共享库页，不等于独占物理 RAM 增量。Go 指标包含单个 Go 控制器及所有嵌入式 C++ Core。协议握手和节点波动均会计入耗时，不能仅凭一轮对比推断 Go/CLI 的稳定提速比例。
+CLI 指标来自实际 OpenVPN 子进程 PID，而非 Python 编排器；两种后端都测量到其就绪事件，CLI 使用 `--route-delay 0`，不额外计入固定等待。RSS/峰值对于多个 CLI 进程累加，可能重复计入共享库页，不等于独占物理 RAM 增量。Go 指标包含 Go 控制器与所有嵌入式 C++ Core，服务端和 HTTP 服务不计入。本基准不测量公网 RTT、持续吞吐或志愿者节点的服务端开销，不能用一轮数据推断稳定提速比例。
 
 ## 边界
 

@@ -89,7 +89,9 @@ class CLIConnection:
             "--config", str(config_path),
             "--auth-user-pass", str(auth_path),
             "--connect-timeout", str(self.connect_timeout),
-            "--route-delay", "2",
+            # Measure readiness without an artificial post-TUN sleep. Core
+            # likewise considers CONNECTED equivalent to a completed TUN setup.
+            "--route-delay", "0",
             "--verb", "4",
         ]
         self._started = time.monotonic()

@@ -1,4 +1,4 @@
-"""Compare real CLI processes and embedded Go/C++ Core on identical profiles."""
+"""Measure CLI and Go/Core against one controlled server in GitHub Actions."""
 
 from __future__ import annotations
 
@@ -8,17 +8,13 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from .cli_backend import CLIConnection
-from .live_vpngate import (
-    cleanup_policy_routing,
-    command_ip,
-    load_candidates,
-    prepare_policy_routing,
-)
-from .profiles import prepare_profile
+from .live_vpngate import cleanup_policy_routing, prepare_policy_routing
+from .local_testbed import Testbed, local_testbed
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
@@ -46,47 +42,8 @@ def proc_status(pid: int) -> dict[str, int | float]:
     return values
 
 
-def prepare_profiles(workdir: Path, maximum: int) -> tuple[list[str], list[Path], list[dict[str, Any]]]:
-    """Select distinct healthy nodes with one throwaway CLI tunnel per node."""
-    profile_dir = workdir / "profiles"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    attempts: list[dict[str, Any]] = []
-    labels: list[str] = []
-    paths: list[Path] = []
-    seen_nodes: set[str] = set()
-    for label, profile in load_candidates(12, workdir / "vpngate.csv"):
-        if len(paths) == maximum:
-            break
-        if label in seen_nodes:
-            continue
-        seen_nodes.add(label)
-        connection = CLIConnection(profile, connect_timeout=15, device="tun9")
-        try:
-            connection.start()
-            connection.wait_connected(25)
-            path = profile_dir / f"tun{len(paths)}.ovpn"
-            path.write_text(prepare_profile(profile, f"tun{len(paths)}"), encoding="utf-8")
-            paths.append(path)
-            labels.append(label)
-            attempts.append({"node": label, "passed": True, "connect_ms": connection.ready_ms})
-            print(f"PRECHECK OK {label}: {connection.ready_ms:.0f} ms", flush=True)
-        except Exception as exc:
-            attempts.append({
-                "node": label,
-                "passed": False,
-                "error": str(exc),
-                "logs": connection.logs[-8:],
-            })
-            print(f"PRECHECK SKIP {label}: {connection.logs[-1:]}", flush=True)
-        finally:
-            connection.close()
-        write_json(workdir / "selection.json", {"nodes": labels, "attempts": attempts})
-    if len(paths) != maximum:
-        raise RuntimeError(f"Only {len(paths)} of {maximum} distinct nodes passed the CLI preflight")
-    return labels, paths, attempts
-
-
-def traffic_check(count: int, direct_ip: str) -> list[dict[str, str]]:
+def traffic_check(count: int, target_url: str, expected_body: str) -> list[dict[str, str]]:
+    """Require HTTP from every tunnel to the server-only namespace address."""
     devices = [f"tun{index}" for index in range(count)]
     for device in devices:
         subprocess.run(["ip", "link", "show", "dev", device], check=True, capture_output=True, timeout=5)
@@ -95,11 +52,19 @@ def traffic_check(count: int, direct_ip: str) -> list[dict[str, str]]:
         for index, device in enumerate(devices):
             prepare_policy_routing(device, table=110 + index, priority=32110 + index)
         for device in devices:
-            exit_ip = command_ip(interface=device)
-            if exit_ip == direct_ip:
-                raise RuntimeError(f"{device} leaked to the direct runner IP {direct_ip}")
-            checks.append({"device": device, "exit_ip": exit_ip})
-            print(f"  {device} exit: {exit_ip}", flush=True)
+            result = subprocess.run(
+                ["curl", "--silent", "--show-error", "--fail", "--noproxy", "*",
+                 "--max-time", "8", "--interface", device, target_url],
+                capture_output=True, text=True, timeout=10,
+            )
+            body = result.stdout.strip()
+            if body != expected_body:
+                raise RuntimeError(
+                    f"{device} did not complete tunneled HTTP: rc={result.returncode}; "
+                    f"stderr={result.stderr}; body={body[:200]}"
+                )
+            checks.append({"device": device, "response": body})
+            print(f"  {device} tunneled HTTP: {body}", flush=True)
         return checks
     finally:
         for index in reversed(range(count)):
@@ -119,7 +84,6 @@ def _connect_cli(index: int, profile: str, connection: CLIConnection) -> dict[st
             "info": info,
         }
     except Exception as exc:
-        # Keep the native error after the higher-level readiness timeout.
         diagnostic = " | ".join(connection.logs[-8:])
         try:
             connection.close()
@@ -128,7 +92,7 @@ def _connect_cli(index: int, profile: str, connection: CLIConnection) -> dict[st
         raise RuntimeError(f"tun{index}: {diagnostic}") from exc
 
 
-def cli_connected(profiles: list[Path]) -> tuple[list[CLIConnection], dict[str, Any]]:
+def cli_connected(profiles: Sequence[Path]) -> tuple[list[CLIConnection], dict[str, Any]]:
     started = time.monotonic()
     connections = [
         CLIConnection(path.read_text(encoding="utf-8"), connect_timeout=20, device=f"tun{index}")
@@ -137,8 +101,10 @@ def cli_connected(profiles: list[Path]) -> tuple[list[CLIConnection], dict[str, 
     report = base_report("openvpn2-cli", len(connections))
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(connections)) as pool:
-            sessions = list(pool.map(lambda item: _connect_cli(item[0], item[1], item[2]),
-                                     zip(range(len(connections)), profiles, connections)))
+            sessions = list(pool.map(
+                lambda item: _connect_cli(item[0], item[1], item[2]),
+                zip(range(len(connections)), profiles, connections),
+            ))
         report["sessions"] = sessions
         report["wall_ready_ms"] = round((time.monotonic() - started) * 1000, 3)
         report["max_ready_ms"] = max(session["connect_ms"] for session in sessions)
@@ -188,13 +154,16 @@ def base_report(backend: str, count: int) -> dict[str, Any]:
     }
 
 
-def run_cli(profiles: list[Path], direct_ip: str) -> dict[str, Any]:
+def run_cli(profiles: Sequence[Path], testbed: Testbed) -> dict[str, Any]:
     connections, report = cli_connected(profiles)
     errors: list[str] = []
     try:
-        report["interface_checks"] = traffic_check(len(connections), direct_ip)
-        report["cpu_ms"] = sum(proc_status(connection.process_id)["cpu_ms"]
-                              for connection in connections if connection.process_id)
+        report["interface_checks"] = traffic_check(len(connections), testbed.target_url, testbed.expected_body)
+        report["cpu_ms"] = sum(
+            proc_status(connection.process_id)["cpu_ms"]
+            for connection in connections
+            if connection.process_id
+        )
     except Exception as exc:
         errors.append(str(exc))
     try:
@@ -209,7 +178,9 @@ def run_cli(profiles: list[Path], direct_ip: str) -> dict[str, Any]:
     return report
 
 
-def run_go(profiles: list[Path], case_dir: Path, go_binary: Path, direct_ip: str) -> dict[str, Any]:
+def run_go(
+    profiles: Sequence[Path], case_dir: Path, go_binary: Path, testbed: Testbed,
+) -> dict[str, Any]:
     ready_file = case_dir / "ready"
     report_file = case_dir / "report.json"
     stop_file = case_dir / "stop"
@@ -237,7 +208,7 @@ def run_go(profiles: list[Path], case_dir: Path, go_binary: Path, direct_ip: str
             ready_report = json.loads(report_file.read_text(encoding="utf-8"))
             if ready_report.get("stage") != "connected":
                 raise RuntimeError(f"Unexpected Go ready stage: {ready_report.get('stage')}")
-            checks = traffic_check(len(profiles), direct_ip)
+            checks = traffic_check(len(profiles), testbed.target_url, testbed.expected_body)
         except Exception as exc:
             errors.append(str(exc))
         finally:
@@ -250,7 +221,10 @@ def run_go(profiles: list[Path], case_dir: Path, go_binary: Path, direct_ip: str
                 errors.append("Go benchmark required SIGKILL during cleanup")
             if process.returncode != 0:
                 errors.append(f"Go benchmark exited with {process.returncode}; logs: {log_path}")
-    report = json.loads(report_file.read_text(encoding="utf-8")) if report_file.exists() else base_report("go-openvpn3-core", len(profiles))
+    if report_file.exists():
+        report = json.loads(report_file.read_text(encoding="utf-8"))
+    else:
+        report = base_report("go-openvpn3-core", len(profiles))
     report["interface_checks"] = checks
     if errors:
         report["stage"] = "failed"
@@ -274,58 +248,59 @@ def main() -> None:
 
     workdir = args.workdir
     workdir.mkdir(parents=True, exist_ok=True)
-    labels, profile_paths, preflight_attempts = prepare_profiles(workdir, max(args.concurrency))
-    direct_ip = command_ip()
-    print(f"Selected nodes: {labels}; direct exit: {direct_ip}", flush=True)
     version = subprocess.run(["openvpn", "--version"], check=True, capture_output=True, text=True, timeout=5)
-    results: list[dict[str, Any]] = []
-    failures = False
-    for count in args.concurrency:
-        selected = profile_paths[:count]
-        for backend in ("go", "cli"):
-            case_dir = workdir / f"{backend}-{count}"
-            case_dir.mkdir(exist_ok=True)
-            print(f"START {backend} with {count} tunnel(s)", flush=True)
-            try:
-                if backend == "go":
-                    report = run_go(selected, case_dir, args.go_binary, direct_ip)
-                else:
-                    report = run_cli(selected, direct_ip)
-                if backend == "cli":
-                    report["openvpn_version"] = version.stdout.splitlines()[0]
-                    report["ready_time_note"] = "connect_ms includes --route-delay 2 used by the CLI adapter"
-                report["profile_nodes"] = labels[:count]
-                report["measurement_note"] = "One run per paired VPNGate node; no statistical speedup claim"
-                report["stage"] = "stopped"
-            except Exception as exc:
-                report_file = case_dir / "report.json"
-                report = base_report("go-openvpn3-core" if backend == "go" else "openvpn2-cli", count)
-                if backend == "go" and report_file.exists():
-                    report = json.loads(report_file.read_text(encoding="utf-8"))
-                report["stage"] = "failed"
-                report.setdefault("errors", []).append(str(exc))
-                failures = True
-            write_json(case_dir / "final.json", report)
-            results.append(report)
-            print(json.dumps({
-                "backend": backend, "count": count, "stage": report["stage"],
-                "wall_ready_ms": report.get("wall_ready_ms"),
-                "max_ready_ms": report.get("max_ready_ms"),
-                "current_rss_kb_after_connect": report.get("current_rss_kb_after_connect"),
-                "peak_rss_kb": report.get("peak_rss_kb"),
-                "threads_after_connect": report.get("threads_after_connect"),
-                "engine_process_count": report.get("engine_process_count"),
-                "errors": report.get("errors"),
-            }, ensure_ascii=False), flush=True)
+    with local_testbed(workdir, max(args.concurrency)) as testbed:
+        profile_paths = testbed.profiles
+        labels = [f"vpngate-benchmark-client{index}" for index in range(len(profile_paths))]
+        print(f"Controlled testbed: {testbed.target_url}", flush=True)
+        results: list[dict[str, Any]] = []
+        failures = False
+        for count in args.concurrency:
+            selected = profile_paths[:count]
+            for backend in ("go", "cli"):
+                case_dir = workdir / f"{backend}-{count}"
+                case_dir.mkdir(exist_ok=True)
+                print(f"START {backend} with {count} tunnel(s)", flush=True)
+                try:
+                    if backend == "go":
+                        report = run_go(selected, case_dir, args.go_binary, testbed)
+                    else:
+                        report = run_cli(selected, testbed)
+                        report["openvpn_version"] = version.stdout.splitlines()[0]
+                    report["profile_nodes"] = labels[:count]
+                    report["measurement_note"] = (
+                        "One controlled local run; real TLS/TUN without public RTT; "
+                        "no statistical or throughput conclusion"
+                    )
+                except Exception as exc:
+                    report_file = case_dir / "report.json"
+                    report = base_report("go-openvpn3-core" if backend == "go" else "openvpn2-cli", count)
+                    if backend == "go" and report_file.exists():
+                        report = json.loads(report_file.read_text(encoding="utf-8"))
+                    report["stage"] = "failed"
+                    report.setdefault("errors", []).append(str(exc))
+                    failures = True
+                write_json(case_dir / "final.json", report)
+                results.append(report)
+                print(json.dumps({
+                    "backend": backend, "count": count, "stage": report["stage"],
+                    "wall_ready_ms": report.get("wall_ready_ms"),
+                    "max_ready_ms": report.get("max_ready_ms"),
+                    "current_rss_kb_after_connect": report.get("current_rss_kb_after_connect"),
+                    "peak_rss_kb": report.get("peak_rss_kb"),
+                    "threads_after_connect": report.get("threads_after_connect"),
+                    "engine_process_count": report.get("engine_process_count"),
+                    "errors": report.get("errors"),
+                }, ensure_ascii=False), flush=True)
 
-    write_json(workdir / "comparison.json", {
-        "nodes": labels,
-        "direct_ip": direct_ip,
-        "preflight": preflight_attempts,
-        "results": results,
-    })
+        write_json(workdir / "comparison.json", {
+            "mode": "runner-local-openvpn-server",
+            "target_url": testbed.target_url,
+            "nodes": labels,
+            "results": results,
+        })
     if failures:
-        raise SystemExit("At least one benchmark failed; inspect the per-case final.json and go.log artifacts")
+        raise SystemExit("At least one benchmark failed; inspect final.json, server logs and go.log artifacts")
 
 
 if __name__ == "__main__":
