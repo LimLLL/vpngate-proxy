@@ -95,6 +95,8 @@ def check_server(process: subprocess.Popen[str], log_path: Path) -> None:
 @contextmanager
 def local_testbed(workdir: Path, maximum: int) -> Iterator[Testbed]:
     """Run a real server in an isolated namespace, with distinct client certificates."""
+    if maximum < 1 or maximum > 128:
+        raise ValueError("Testbed concurrency must be between 1 and 128")
     private = workdir / "private"
     private.mkdir(parents=True, exist_ok=True)
     (private / "web").mkdir(exist_ok=True)
@@ -164,7 +166,7 @@ key {private / 'server.key'}
 tls-crypt {tls_key}
 script-security 2
 auth-user-pass-verify {auth_script} via-file
-max-clients {maximum * 2 + 8}
+max-clients {min(250, maximum * 2 + 8)}
 keepalive 10 120
 persist-tun
 verb 3
@@ -249,7 +251,7 @@ remote-cert-tls server
                 raise TimeoutError("Local HTTP endpoint is not listening in the server namespace")
             yield Testbed(
                 tuple(profiles), f"http://{server_ip}:{http_port}/health.txt", "vpngate-tunnel-ok",
-                maximum * 2 + 8,
+                min(250, maximum * 2 + 8),
             )
         finally:
             if namespace_created:

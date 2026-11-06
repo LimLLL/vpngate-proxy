@@ -47,12 +47,12 @@ GitHub Actions run `42195536699` 对同一个 VPNGate 节点完成了 Go/C++ Cor
 此前的公网配对测试同时观察到了单隧道成功及同一节点偶发 `AUTH_FAILED`。SoftEther 的服务端可以限制同一用户的并发登录数，但客户端无法据此断定具体志愿者节点的拒绝原因；因此公网可用性保留在 `openvpn3-go.yml`，性能基准改用上述受控环境。
 
 ```bash
-gh workflow run openvpn3-benchmark.yml --repo LimLLL/vpngate-proxy -f concurrency=all
+gh workflow run openvpn3-benchmark.yml --repo LimLLL/vpngate-proxy -f concurrency=high
 gh run list --repo LimLLL/vpngate-proxy --workflow openvpn3-benchmark.yml --limit 1
 gh run watch --repo LimLLL/vpngate-proxy
 ```
 
-`concurrency` 可选 `1`、`2`、`4` 或 `all`。每个 case 的 `final.json`、Go 原生日志及统一 `comparison.json` 会上传为 Actions artifact。
+`concurrency` 可选 `1`、`2`、`4`、`16`、`64`、`128`、`high`（16、64、128）或 `all`。其中 `high` 目前处于高并发回收与资源压力的实验验证阶段。每个 case 的 `final.json`、Go 原生日志及统一 `comparison.json` 会上传为 Actions artifact；报告记录已连接、实际验证和成功回收的隧道数，而非仅记录对象创建数量。
 
 测量包括：
 

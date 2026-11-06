@@ -17,6 +17,9 @@ from .live_vpngate import cleanup_policy_routing, prepare_policy_routing
 from .local_testbed import Testbed, local_testbed
 
 
+MAX_BENCHMARK_TUNNELS = 128
+
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -51,11 +54,11 @@ def traffic_check(count: int, target_url: str, expected_body: str) -> list[dict[
     try:
         for index, device in enumerate(devices):
             prepare_policy_routing(device, table=110 + index, priority=32110 + index)
-        for device in devices:
+        def check(device: str) -> dict[str, str]:
             result = subprocess.run(
                 ["curl", "--silent", "--show-error", "--fail", "--noproxy", "*",
-                 "--max-time", "8", "--interface", device, target_url],
-                capture_output=True, text=True, timeout=10,
+                 "--max-time", "15", "--interface", device, target_url],
+                capture_output=True, text=True, timeout=17,
             )
             body = result.stdout.strip()
             if body != expected_body:
@@ -63,8 +66,12 @@ def traffic_check(count: int, target_url: str, expected_body: str) -> list[dict[
                     f"{device} did not complete tunneled HTTP: rc={result.returncode}; "
                     f"stderr={result.stderr}; body={body[:200]}"
                 )
-            checks.append({"device": device, "response": body})
-            print(f"  {device} tunneled HTTP: {body}", flush=True)
+            return {"device": device, "response": body}
+
+        # Do not turn simultaneous tunnel validation into long serial polling.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, 32)) as pool:
+            checks = list(pool.map(check, devices))
+        print(f"  {len(checks)}/{count} tunnels completed HTTP validation", flush=True)
         return checks
     finally:
         for index in reversed(range(count)):
@@ -75,7 +82,7 @@ def _connect_cli(index: int, profile: str, connection: CLIConnection) -> dict[st
     started = time.monotonic()
     try:
         connection.start()
-        info = connection.wait_connected(30)
+        info = connection.wait_connected(90)
         return {
             "device": f"tun{index}",
             "configure_ms": connection.spawn_ms,
@@ -96,7 +103,7 @@ def cli_connected(profiles: Sequence[Path], log_dir: Path) -> tuple[list[CLIConn
     started = time.monotonic()
     connections = [
         CLIConnection(
-            path.read_text(encoding="utf-8"), connect_timeout=20,
+            path.read_text(encoding="utf-8"), connect_timeout=min(120, 30 + 4 * len(profiles)),
             device=f"tun{index}", log_path=log_dir / f"cli-{index}.log",
         )
         for index, path in enumerate(profiles)
@@ -191,23 +198,28 @@ def run_go(
     for path in (ready_file, report_file, stop_file):
         path.unlink(missing_ok=True)
     log_path = case_dir / "go.log"
+    count = len(profiles)
+    connect_timeout = min(120, 30 + 4 * count)
+    stop_timeout = min(60, 10 + count // 4)
     command = [
-        "timeout", "--signal=TERM", "--kill-after=5s", "85s", str(go_binary),
+        "timeout", "--signal=TERM", "--kill-after=5s", f"{connect_timeout + 2 * stop_timeout + 45}s",
+        str(go_binary),
         "--profiles", ",".join(str(path) for path in profiles),
         "--ready-file", str(ready_file), "--stop-file", str(stop_file),
-        "--report", str(report_file), "--stop-deadline", "55s",
+        "--report", str(report_file), "--stop-deadline", f"{max(60, count + 30)}s",
+        "--connect-deadline", f"{connect_timeout}s", "--stop-timeout", f"{stop_timeout}s",
     ]
     errors: list[str] = []
     checks: list[dict[str, str]] = []
     with log_path.open("w", encoding="utf-8") as logs:
         process = subprocess.Popen(command, stdout=logs, stderr=subprocess.STDOUT, text=True)
         try:
-            deadline = time.monotonic() + 45
+            deadline = time.monotonic() + connect_timeout + 15
             while not ready_file.exists():
                 if process.poll() is not None:
                     raise RuntimeError("Go benchmark exited before all tunnels were ready")
                 if time.monotonic() > deadline:
-                    raise TimeoutError("Go tunnels did not all become ready within 45s")
+                    raise TimeoutError(f"Go tunnels did not all become ready within {connect_timeout}s")
                 time.sleep(0.25)
             ready_report = json.loads(report_file.read_text(encoding="utf-8"))
             if ready_report.get("stage") != "connected":
@@ -218,7 +230,7 @@ def run_go(
         finally:
             stop_file.touch()
             try:
-                process.wait(timeout=15)
+                process.wait(timeout=stop_timeout + 10)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
@@ -247,8 +259,9 @@ def main() -> None:
         raise SystemExit("Benchmark must run as root in the dedicated GitHub Actions runner")
     if not args.go_binary.is_file():
         raise SystemExit(f"Go benchmark binary is missing: {args.go_binary}")
-    if not args.concurrency or any(count not in (1, 2, 4) for count in args.concurrency):
-        raise SystemExit("Each --concurrency must be 1, 2 or 4")
+    if not args.concurrency or any(count not in range(1, MAX_BENCHMARK_TUNNELS + 1)
+                                   for count in args.concurrency):
+        raise SystemExit("Each --concurrency must be an integer from 1 through 128")
 
     workdir = args.workdir
     workdir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +293,14 @@ def main() -> None:
                     report["measurement_note"] = (
                         "One controlled local run; real TLS/TUN without public RTT; "
                         "no statistical or throughput conclusion"
+                    )
+                    report["connected_tunnels"] = sum(
+                        bool(session.get("info", {}).get("defined")) for session in report["sessions"]
+                    )
+                    report["verified_tunnels"] = len(report.get("interface_checks", []))
+                    report["reclaimed_tunnels"] = sum(
+                        session.get("close_ms", 0) > 0 and not session.get("error")
+                        for session in report["sessions"]
                     )
             except Exception as exc:
                 report["stage"] = "failed"

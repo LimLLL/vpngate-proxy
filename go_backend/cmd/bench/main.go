@@ -18,11 +18,10 @@ import (
 )
 
 type options struct {
-	profiles     []string
-	readyFile    string
-	stopFile     string
-	reportFile   string
-	stopDeadline time.Duration
+	profiles        []string
+	connectDeadline time.Duration
+	stopTimeout     time.Duration
+	stopDeadline    time.Duration
 }
 
 type sessionReport struct {
@@ -117,7 +116,7 @@ func writeReport(path string, report runReport) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-func closeAll(clients []*core.Client, report *runReport) error {
+func closeAll(clients []*core.Client, report *runReport, stopTimeout time.Duration) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var stopErrors []error
@@ -128,7 +127,7 @@ func closeAll(clients []*core.Client, report *runReport) error {
 		wg.Add(1)
 		go func(index int, client *core.Client) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 			defer cancel()
 			started := time.Now()
 			err := client.Close(ctx)
@@ -173,7 +172,7 @@ func connectAll(opts options, clients []*core.Client, report *runReport) error {
 	responses := make(chan sessionResult, len(clients))
 	for index, client := range clients {
 		go func(index int, client *core.Client) {
-			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), opts.connectDeadline)
 			defer cancel()
 			started := time.Now()
 			info, err := client.Connect(ctx)
@@ -229,11 +228,20 @@ func main() {
 	stopFile := flag.String("stop-file", "", "file requesting benchmark shutdown")
 	reportFile := flag.String("report", "", "path for the benchmark JSON report")
 	stopDeadline := flag.Duration("stop-deadline", 60*time.Second, "maximum wait for the external traffic check")
+	connectDeadline := flag.Duration("connect-deadline", 60*time.Second, "per-tunnel connection timeout")
+	stopTimeout := flag.Duration("stop-timeout", 10*time.Second, "per-tunnel stop timeout")
 	flag.Parse()
 	paths := strings.Split(*profileList, ",")
-	if *profileList == "" || len(paths) < 1 || len(paths) > 4 || *readyFile == "" || *stopFile == "" || *reportFile == "" {
+	if *profileList == "" || len(paths) < 1 || len(paths) > 128 || *readyFile == "" || *stopFile == "" || *reportFile == "" {
 		flag.Usage()
-		log.Fatal("one to four profiles and ready, stop and report paths are required")
+		log.Fatal("one to 128 profiles and ready, stop and report paths are required")
+	}
+	if *connectDeadline <= 0 || *stopTimeout <= 0 {
+		log.Fatal("connect and stop timeouts must be positive")
+	}
+	opts := options{
+		profiles: paths, stopDeadline: *stopDeadline,
+		connectDeadline: *connectDeadline, stopTimeout: *stopTimeout,
 	}
 
 	started := time.Now()
@@ -247,7 +255,7 @@ func main() {
 	}
 	clients := make([]*core.Client, len(paths))
 	var resultErr error
-	if err := connectAll(options{profiles: paths}, clients, &report); err != nil {
+	if err := connectAll(opts, clients, &report); err != nil {
 		resultErr = err
 		report.Stage = "connect_failed"
 	} else {
@@ -287,7 +295,7 @@ func main() {
 	} else {
 		report.CPUMs = cpuEnd - cpuStart
 	}
-	if err := closeAll(clients, &report); err != nil {
+	if err := closeAll(clients, &report, opts.stopTimeout); err != nil {
 		resultErr = errors.Join(resultErr, err)
 		report.Stage = "stop_failed"
 	} else if resultErr == nil {

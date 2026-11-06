@@ -6,13 +6,17 @@ on:
       concurrency:
         description: Tunnel concurrency values to measure
         required: true
-        default: all
+        default: high
         type: choice
         options:
+          - high
           - all
           - '1'
           - '2'
           - '4'
+          - '16'
+          - '64'
+          - '128'
 
 permissions:
   contents: read
@@ -57,16 +61,17 @@ jobs:
         env:
           CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
 
-      - name: Measure 1, 2 and 4 concurrent tunnels against a controlled server
+      - name: Measure up to 128 concurrent tunnels against controlled servers
         run: |
           case '${{ inputs.concurrency }}' in
-            all) benchmark_args=(--concurrency 1 --concurrency 2 --concurrency 4) ;;
-            1|2|4) benchmark_args=(--concurrency '${{ inputs.concurrency }}') ;;
+            high) benchmark_args=(--concurrency 16 --concurrency 64 --concurrency 128) ;;
+            all) benchmark_args=(--concurrency 1 --concurrency 2 --concurrency 4 --concurrency 16 --concurrency 64 --concurrency 128) ;;
+            1|2|4|16|64|128) benchmark_args=(--concurrency '${{ inputs.concurrency }}') ;;
             *) echo "Invalid concurrency" >&2; exit 64 ;;
           esac
           sudo modprobe tun
           test -c /dev/net/tun
-          sudo timeout --signal=TERM --kill-after=10s 15m \
+          sudo timeout --signal=TERM --kill-after=10s 17m \
             python3 -m openvpn3_backend.benchmark \
             --workdir "${RUNNER_TEMP}/vpngate-benchmark" \
             --go-binary "${RUNNER_TEMP}/vpngate-go-benchmark" \
