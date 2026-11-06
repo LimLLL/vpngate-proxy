@@ -59,6 +59,8 @@ scratch/
 _site/
 *连接配置*
 test_*.py
+!tests/test_*.py
+!openvpn3_backend/tests/test_*.py
 *.bak
 *.orig
 

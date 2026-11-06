@@ -5,7 +5,9 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/openvpn3-core.yml"
+      - ".gitignore"
       - "openvpn3_backend/**"
+      - "tests/**"
       - "mirror/vpngate.csv"
       - "snapshot_utils.py"
   workflow_dispatch:
@@ -28,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install native build dependencies
         run: |
