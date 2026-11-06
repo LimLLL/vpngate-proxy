@@ -52,7 +52,7 @@ gh run list --repo LimLLL/vpngate-proxy --workflow openvpn3-benchmark.yml --limi
 gh run watch --repo LimLLL/vpngate-proxy
 ```
 
-`concurrency` 可选 `1`、`2`、`4`、`16`、`64`、`128`、`high`（16、64、128）或 `all`。其中 `high` 目前处于高并发回收与资源压力的实验验证阶段。每个 case 的 `final.json`、Go 原生日志及统一 `comparison.json` 会上传为 Actions artifact；报告记录已连接、实际验证和成功回收的隧道数，而非仅记录对象创建数量。
+`concurrency` 可选 `1`、`2`、`4`、`16`、`64`、`128`、`high`（16、64、128）或 `all`。每个 case 的 `final.json`、Go 原生日志及统一 `comparison.json` 会上传为 Actions artifact；报告记录已连接、实际验证和成功回收的隧道数，而非仅记录对象创建数量。
 
 测量包括：
 
@@ -76,7 +76,21 @@ CLI 指标来自实际 OpenVPN 子进程 PID，而非 Python 编排器；两种�
 
 每路 Go 停止约 9.6 至 17.4 ms；该成功报告见 `openvpn3-benchmark-all-10/comparison.json` 及各 case `final.json`。实际 benchmark 使用真实 UDP、TLS、certificate + username/password 认证和独立 TUN，不模拟握手。
 
-重要限制：每个 case 创建独立受控服务端、PKI 与 namespace，并用 N 个不同传输地址避免当前测试里观察到的 OpenVPN 2.6 UDP 分路行为污染数据；常规公网隧道端口并不天然采用相同拓扑。已跑通的度量只对这些真实协议 testbed 负责，不模拟 VPNGate 的速度或负载，也不推断发布性能指标。Go 测得的是单进程多引擎的进程、线程和生命周期收益，协议与加密仍由官方 C++ Core 执行。它没有实现 session 粘滞、TTL 或隧道预热，因此不能仅凭这组数字选型为正式 session-xxx-t-TTL 商业代理。
+重要限制：每个 case 创建受控服务端、PKI 与独立 namespace。真实流量都从各客户端 TUN 进入测试服务器的私有 HTTP 验证点。它不测量公网 RTT、吞吐或志愿者节点负荷，也不模拟 VPNGate 调度，不能据此推断发布性能指标。Go 测得的是单进程多引擎的进程、线程和生命周期收益，协议与加密仍由官方 C++ Core 执行。它没有实现 session 粘滞、TTL 或隧道预热，因此不能仅凭这组数字选型为正式 session-xxx-t-TTL 商业代理。
+
+## 高并发实测
+
+[GitHub Actions run 42248771643](https://github.com/LimLLL/vpngate-proxy/actions/runs/42248771643) 已在受控真实协议环境跑完 `high`（16、64、128）双后端对照，最终状态 `completed / success`：
+
+| 并发 | Go / CLI 全部就绪墙钟 | Go / CLI 活跃 RSS* | Go / CLI 进程数 | Go / CLI 线程数 |
+| --- | --- | --- | --- | --- |
+| 16 | 0.51 / 0.46 秒 | 19.4 / 158.0 MiB | 1 / 16 | 21 / 16 |
+| 64 | 1.85 / 1.87 秒 | 32.3 / 632.4 MiB | 1 / 64 | 69 / 64 |
+| 128 | 4.60 / 4.58 秒 | 50.1 / 1264.3 MiB | 1 / 128 | 133 / 128 |
+
+这三个规模的每种后端均逐路完成 HTTP 检查，数量等于要求的并发数，并全部停止并释放相关 TUN。128 路最慢停止时间约为 Go 221 ms、CLI 501 ms。这证明了原 Go 控制器裸链路可以扩展到至少 128 个同时存活的官方 C++ Client 实例。
+
+*CLI RSS 是进程求和，重复计入共享库，不等于独占系统物理内存；报告保留的是可能被高估的对照指标，不据此声称精确的节省内存倍数。Go 包含控制器及全部 C++ 实例，其开销在该进程内计入。
 
 ## 边界
 

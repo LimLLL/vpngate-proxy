@@ -294,8 +294,10 @@ def main() -> None:
                         "One controlled local run; real TLS/TUN without public RTT; "
                         "no statistical or throughput conclusion"
                     )
+                    # Both adapters only expose a TUN name after their actual
+                    # native/CLI CONNECTED result; `defined` is Core-specific.
                     report["connected_tunnels"] = sum(
-                        bool(session.get("info", {}).get("defined")) for session in report["sessions"]
+                        bool(session.get("info", {}).get("tunName")) for session in report["sessions"]
                     )
                     report["verified_tunnels"] = len(report.get("interface_checks", []))
                     report["reclaimed_tunnels"] = sum(
