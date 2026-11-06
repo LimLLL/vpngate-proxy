@@ -57,7 +57,7 @@ jobs:
         env:
           CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
 
-      - name: Measure 1, 2 and 4 concurrent tunnels on the same node
+      - name: Measure 1, 2 and 4 concurrent tunnels on paired nodes
         run: |
           case '${{ inputs.concurrency }}' in
             all) benchmark_args=(--concurrency 1 --concurrency 2 --concurrency 4) ;;

@@ -46,27 +46,54 @@ def proc_status(pid: int) -> dict[str, int | float]:
     return values
 
 
-def prepare_profiles(workdir: Path, maximum: int) -> tuple[str, list[Path]]:
+def prepare_profiles(workdir: Path, maximum: int) -> tuple[list[str], list[Path], list[dict[str, Any]]]:
+    """Select distinct healthy nodes with one throwaway CLI tunnel per node."""
     profile_dir = workdir / "profiles"
     profile_dir.mkdir(parents=True, exist_ok=True)
-    snapshot = workdir / "vpngate.csv"
-    label, profile = load_candidates(1, snapshot)[0]
+    attempts: list[dict[str, Any]] = []
+    labels: list[str] = []
     paths: list[Path] = []
-    for index in range(maximum):
-        path = profile_dir / f"tun{index}.ovpn"
-        path.write_text(prepare_profile(profile, f"tun{index}"), encoding="utf-8")
-        paths.append(path)
-    return label, paths
+    seen_nodes: set[str] = set()
+    for label, profile in load_candidates(12, workdir / "vpngate.csv"):
+        if len(paths) == maximum:
+            break
+        if label in seen_nodes:
+            continue
+        seen_nodes.add(label)
+        connection = CLIConnection(profile, connect_timeout=15, device="tun9")
+        try:
+            connection.start()
+            connection.wait_connected(25)
+            path = profile_dir / f"tun{len(paths)}.ovpn"
+            path.write_text(prepare_profile(profile, f"tun{len(paths)}"), encoding="utf-8")
+            paths.append(path)
+            labels.append(label)
+            attempts.append({"node": label, "passed": True, "connect_ms": connection.ready_ms})
+            print(f"PRECHECK OK {label}: {connection.ready_ms:.0f} ms", flush=True)
+        except Exception as exc:
+            attempts.append({
+                "node": label,
+                "passed": False,
+                "error": str(exc),
+                "logs": connection.logs[-8:],
+            })
+            print(f"PRECHECK SKIP {label}: {connection.logs[-1:]}", flush=True)
+        finally:
+            connection.close()
+        write_json(workdir / "selection.json", {"nodes": labels, "attempts": attempts})
+    if len(paths) != maximum:
+        raise RuntimeError(f"Only {len(paths)} of {maximum} distinct nodes passed the CLI preflight")
+    return labels, paths, attempts
 
 
 def traffic_check(count: int, direct_ip: str) -> list[dict[str, str]]:
     devices = [f"tun{index}" for index in range(count)]
     for device in devices:
         subprocess.run(["ip", "link", "show", "dev", device], check=True, capture_output=True, timeout=5)
-    for index, device in enumerate(devices):
-        prepare_policy_routing(device, table=110 + index, priority=32110 + index)
+    checks: list[dict[str, str]] = []
     try:
-        checks = []
+        for index, device in enumerate(devices):
+            prepare_policy_routing(device, table=110 + index, priority=32110 + index)
         for device in devices:
             exit_ip = command_ip(interface=device)
             if exit_ip == direct_ip:
@@ -247,9 +274,9 @@ def main() -> None:
 
     workdir = args.workdir
     workdir.mkdir(parents=True, exist_ok=True)
-    label, profile_paths = prepare_profiles(workdir, max(args.concurrency))
+    labels, profile_paths, preflight_attempts = prepare_profiles(workdir, max(args.concurrency))
     direct_ip = command_ip()
-    print(f"Candidate: {label}; direct exit: {direct_ip}", flush=True)
+    print(f"Selected nodes: {labels}; direct exit: {direct_ip}", flush=True)
     version = subprocess.run(["openvpn", "--version"], check=True, capture_output=True, text=True, timeout=5)
     results: list[dict[str, Any]] = []
     failures = False
@@ -267,7 +294,8 @@ def main() -> None:
                 if backend == "cli":
                     report["openvpn_version"] = version.stdout.splitlines()[0]
                     report["ready_time_note"] = "connect_ms includes --route-delay 2 used by the CLI adapter"
-                report["measurement_note"] = "Single deployment on a volatile VPNGate peer; no statistical speedup claim"
+                report["profile_nodes"] = labels[:count]
+                report["measurement_note"] = "One run per paired VPNGate node; no statistical speedup claim"
                 report["stage"] = "stopped"
             except Exception as exc:
                 report_file = case_dir / "report.json"
@@ -290,7 +318,12 @@ def main() -> None:
                 "errors": report.get("errors"),
             }, ensure_ascii=False), flush=True)
 
-    write_json(workdir / "comparison.json", {"candidate": label, "direct_ip": direct_ip, "results": results})
+    write_json(workdir / "comparison.json", {
+        "nodes": labels,
+        "direct_ip": direct_ip,
+        "preflight": preflight_attempts,
+        "results": results,
+    })
     if failures:
         raise SystemExit("At least one benchmark failed; inspect the per-case final.json and go.log artifacts")
 

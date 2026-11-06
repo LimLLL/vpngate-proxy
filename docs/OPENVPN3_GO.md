@@ -40,7 +40,9 @@ GitHub Actions run `42195536699` 对同一个 VPNGate 节点完成了 Go/C++ Cor
 
 ## 并发与开销基准
 
-`openvpn3-benchmark.yml` 使用同一节点的相同 profile，在一个 Go 进程中嵌入 N 个 C++ Core 实例，与 N 个 OpenVPN 2.x CLI 进程对比。每个接口独立执行策略路由、绑定网卡的公网访问与出口 IP 检查。
+`openvpn3-benchmark.yml` 从同一份快照中选择 N 个预检通过的不同节点，在一个 Go 进程中嵌入 N 个 C++ Core 实例，与 N 个 OpenVPN 2.x CLI 进程对比。每种后端都使用相同编号、相同 profile 的节点，接口独立执行策略路由、绑定网卡的公网访问与出口 IP 检查。
+
+预检用临时 CLI 隧道验证候选握手，跳过认证失败等不健康节点；预检不计入基准耗时。这样避免同一公开 profile 的重复异步登录被志愿者服务器拒绝（`AUTH_FAILED`），影响并发引擎的对照。`duplicate-cn` 是服务端设置，无法由客户端任意打开，也不能据此承诺不同节点在测试期间始终可用。
 
 ```bash
 gh workflow run openvpn3-benchmark.yml --repo LimLLL/vpngate-proxy -f concurrency=all
