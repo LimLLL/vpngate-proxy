@@ -6,7 +6,7 @@
 
 - 固定 OpenVPN 3 Core 源码 commit，避免上游变化破坏可复现性。
 - 使用官方 `client/ovpncli.i` 和 CMake `ovpnclilib` target 生成扩展。
-- `core.py` 调用 `ClientAPI_OpenVPNClientHelper` 和 `ClientAPI_OpenVPNClient`。
+- `core.py` 调用 `ClientAPI_OpenVPNClientHelper` 和 `ClientAPI_OpenVPNClient`。当前 pin 版本的 `crypto_self_test()` 在 OpenSSL 构建下是上游明确的空操作，不据此宣称加密自检已通过。
 - SWIG director 把 C++ 的 `event()`、`log()` 等调用转回 Python。
 - 默认追加 `route-nopull`，防止实验连接改写宿主机默认路由。
 - `live_vpngate.py` 在独立 GitHub runner 上连接真实节点，再复用项目现有 SOCKS5 代理检查出口 IP。

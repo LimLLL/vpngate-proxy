@@ -49,9 +49,11 @@ def loopback_profile(profile: str) -> str:
 
 
 class NativeHelperTests(unittest.TestCase):
-    def test_native_platform_and_crypto_self_test(self) -> None:
+    def test_native_platform_and_openssl_self_test_contract(self) -> None:
         self.assertTrue(native_platform())
-        self.assertTrue(native_crypto_self_test())
+        # openvpn/crypto/selftest.hpp disables the OpenSSL call in this build.
+        # Empty output is the upstream contract, not a passing crypto self-test.
+        self.assertEqual(native_crypto_self_test(), "")
 
     def test_cpp_parser_reads_a_real_vpngate_profile(self) -> None:
         result = evaluate_profile(sample_profile())

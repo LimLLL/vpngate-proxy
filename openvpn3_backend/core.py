@@ -101,7 +101,7 @@ def native_platform() -> str:
 
 
 def native_crypto_self_test() -> str:
-    """Run the crypto self-test inside the linked native SSL library."""
+    """Return the upstream self-test output; the OpenSSL path is currently a no-op."""
     return str(ovpncli.ClientAPI_OpenVPNClientHelper().crypto_self_test())
 
 
