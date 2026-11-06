@@ -9,7 +9,6 @@
 #include <cstring>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <string>
 
 class NativeClient final : public openvpn::ClientAPI::OpenVPNClient
@@ -71,6 +70,8 @@ struct VPNHandle
     {
     }
 
+    // The current Core process initializer lives in this helper's lifetime.
+    openvpn::ClientAPI::OpenVPNClientHelper process;
     std::unique_ptr<NativeClient> client;
 };
 
@@ -118,10 +119,8 @@ VPNHandle *vpn_client_new(uint32_t id, VPNEventCallback events, VPNLogCallback l
 {
     if (!events || !logs)
         return nullptr;
-    static std::once_flag initialized;
     try
     {
-        std::call_once(initialized, [] { openvpn::ClientAPI::OpenVPNClientHelper::init_process(); });
         return new VPNHandle{id, events, logs};
     }
     catch (...)
@@ -141,7 +140,7 @@ VPNStatus vpn_client_configure(VPNHandle *handle, const char *profile,
 {
     if (!handle || !profile || !username || !password || connect_timeout < 1)
         return failure("INVALID_ARGUMENT", "invalid client configuration arguments");
-    return guarded([&]() -> VPNStatus {
+    return guarded([&] {
         openvpn::ClientAPI::Config config;
         config.content = profile;
         config.connTimeout = connect_timeout;
@@ -152,7 +151,13 @@ VPNStatus vpn_client_configure(VPNHandle *handle, const char *profile,
         config.tunPersist = false;
         const auto evaluation = handle->client->eval_config(config);
         if (evaluation.error)
-            return failure("OPENVPN3_PROFILE_ERROR", evaluation.message.c_str());
+        {
+            openvpn::ClientAPI::Status result;
+            result.error = true;
+            result.status = "OPENVPN3_PROFILE_ERROR";
+            result.message = evaluation.message;
+            return result;
+        }
         openvpn::ClientAPI::ProvideCreds credentials;
         credentials.username = username;
         credentials.password = password;
