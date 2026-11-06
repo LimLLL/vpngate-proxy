@@ -36,6 +36,28 @@ class NativeClient final : public openvpn::ClientAPI::OpenVPNClient
         return true;
     }
 
+    bool pause_on_connection_timeout() override
+    {
+        return false;
+    }
+
+    void acc_event(const openvpn::ClientAPI::AppCustomControlMessageEvent &) override
+    {
+        // App-specific SSO for other providers is outside this VPNGate prototype.
+    }
+
+    void external_pki_cert_request(openvpn::ClientAPI::ExternalPKICertRequest &request) override
+    {
+        request.error = true;
+        request.errorText = "External PKI is not implemented in this prototype";
+    }
+
+    void external_pki_sign_request(openvpn::ClientAPI::ExternalPKISignRequest &request) override
+    {
+        request.error = true;
+        request.errorText = "External PKI is not implemented in this prototype";
+    }
+
   private:
     uint32_t callback_id_;
     VPNEventCallback events_;
@@ -59,11 +81,6 @@ char *copy_string(const std::string &value)
     char *result = new char[value.size() + 1];
     std::memcpy(result, value.c_str(), value.size() + 1);
     return result;
-}
-
-VPNStatus success()
-{
-    return {0, copy_string(""), copy_string("")};
 }
 
 VPNStatus status_from(const openvpn::ClientAPI::Status &status)
@@ -104,7 +121,7 @@ VPNHandle *vpn_client_new(uint32_t id, VPNEventCallback events, VPNLogCallback l
     static std::once_flag initialized;
     try
     {
-        std::call_once(initialized, [] { openvpn::ClientAPI::OpenVPNClient::init_process(); });
+        std::call_once(initialized, [] { openvpn::ClientAPI::OpenVPNClientHelper::init_process(); });
         return new VPNHandle{id, events, logs};
     }
     catch (...)
@@ -124,10 +141,9 @@ VPNStatus vpn_client_configure(VPNHandle *handle, const char *profile,
 {
     if (!handle || !profile || !username || !password || connect_timeout < 1)
         return failure("INVALID_ARGUMENT", "invalid client configuration arguments");
-    return guarded([&] {
+    return guarded([&]() -> VPNStatus {
         openvpn::ClientAPI::Config config;
         config.content = profile;
-        config.contentLength = std::strlen(profile);
         config.connTimeout = connect_timeout;
         config.autologinSessions = false;
         config.compressionMode = "no";
