@@ -36,7 +36,7 @@ GitHub Actions run `42195536699` 对同一个 VPNGate 节点完成了 Go/C++ Cor
 - Go/C++ 建立的隧道通过项目已有 SOCKS5 代理访问公网，返回节点出口 IP；
 - 相同 profile 的 OpenVPN 2.x CLI 也成功建立隧道与代理流量，计时 `3565 ms`，其中包含适配器设置的 `--route-delay 2`。
 
-这只是同一节点的一次测量，不是统计意义上的性能结论。Python/SWIG 实验在收到原生 `CONNECTED` 后未能恢复 Python 控制线程，当前保留为实验代码，不作为生产后端。Go 的独立链路已经验证成功，本机没有执行构建或测试。
+这只是同一节点的一次测量，不是统计意义上的性能结论；该 CLI 计时还包含当时的固定等待。当前 OpenVPN 2 对照命令已改用 `--route-delay 0`。Python/SWIG 实验在收到原生 `CONNECTED` 后未能恢复 Python 控制线程，当前保留为实验代码，不作为生产后端。Go 的独立链路已经验证成功，本机没有执行构建或测试。
 
 ## 并发与开销基准
 
@@ -63,6 +63,20 @@ gh run watch --repo LimLLL/vpngate-proxy
 - 流量检查到停止前的引擎 CPU 累计时间。
 
 CLI 指标来自实际 OpenVPN 子进程 PID，而非 Python 编排器；两种后端都测量到其就绪事件，CLI 使用 `--route-delay 0`，不额外计入固定等待。RSS/峰值对于多个 CLI 进程累加，可能重复计入共享库页，不等于独占物理 RAM 增量。Go 指标包含 Go 控制器与所有嵌入式 C++ Core，服务端和 HTTP 服务不计入。本基准不测量公网 RTT、持续吞吐或志愿者节点的服务端开销，不能用一轮数据推断稳定提速比例。
+
+## 已验证的并发结果
+
+[GitHub Actions run 42243782997, attempt 2](https://github.com/LimLLL/vpngate-proxy/actions/runs/42243782997) 最终状态 `completed / success`，六个 case 均通过，所有隧道逐个完成真实 HTTP 请求，错误与清理错误列表为空：
+
+| 并发数 | Go + C++ Core 最慢隧道 / 就绪壁钟 | CLI 最慢隧道 / 就绪壁钟 | Go / CLI 活跃 RSS | Go / CLI 进程数 | Go / CLI 线程数 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 42.8 / 45.9 ms | 49.0 / 52.7 ms | 14.2 / 9.5 MiB | 1 / 1 | 6 / 1 |
+| 2 | 88.3 / 92.8 ms | 90.1 / 91.6 ms | 14.7 / 18.8 MiB | 1 / 2 | 7 / 2 |
+| 4 | 154.1 / 161.3 ms | 184.5 / 186.8 ms | 15.4 / 38.1 MiB | 1 / 4 | 9 / 4 |
+
+每路 Go 停止约 9.6 至 17.4 ms；该成功报告见 `openvpn3-benchmark-all-10/comparison.json` 及各 case `final.json`。实际 benchmark 使用真实 UDP、TLS、certificate + username/password 认证和独立 TUN，不模拟握手。
+
+重要限制：每个 case 创建独立受控服务端、PKI 与 namespace，并用 N 个不同传输地址避免当前测试里观察到的 OpenVPN 2.6 UDP 分路行为污染数据；常规公网隧道端口并不天然采用相同拓扑。已跑通的度量只对这些真实协议 testbed 负责，不模拟 VPNGate 的速度或负载，也不推断发布性能指标。Go 测得的是单进程多引擎的进程、线程和生命周期收益，协议与加密仍由官方 C++ Core 执行。它没有实现 session 粘滞、TTL 或隧道预热，因此不能仅凭这组数字选型为正式 session-xxx-t-TTL 商业代理。
 
 ## 边界
 
