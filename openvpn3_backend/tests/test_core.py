@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 
+from openvpn3_backend.benchmark import proc_status
 from openvpn3_backend.core import (
     OpenVPN3Error,
     VPNConnection,
@@ -71,6 +73,15 @@ class NativeHelperTests(unittest.TestCase):
         result = evaluate_profile("this is not an OpenVPN profile\n")
         self.assertTrue(result.error)
         self.assertTrue(result.message)
+
+
+class ProcessMetricTests(unittest.TestCase):
+    def test_proc_parser_handles_thread_count_without_a_unit(self) -> None:
+        metrics = proc_status(os.getpid())
+        self.assertGreater(metrics["VmRSS"], 0)
+        self.assertGreater(metrics["VmHWM"], 0)
+        self.assertGreater(metrics["Threads"], 0)
+        self.assertGreaterEqual(metrics["cpu_ms"], 0)
 
 
 class ProfilePreparationTests(unittest.TestCase):

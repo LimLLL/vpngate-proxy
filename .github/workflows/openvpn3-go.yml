@@ -8,6 +8,9 @@ on:
       - "go_backend/**"
       - "openvpn3_backend/export_live_profile.py"
       - "openvpn3_backend/proxy_smoke.py"
+      - "openvpn3_backend/cli_backend.py"
+      - "openvpn3_backend/live_vpngate.py"
+      - "openvpn3_backend/profiles.py"
   workflow_dispatch:
     inputs:
       live_test:

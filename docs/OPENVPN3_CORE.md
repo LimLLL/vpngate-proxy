@@ -38,7 +38,7 @@ gh run view --repo LimLLL/vpngate-proxy --log
 
 ## 当前边界
 
-这是接入验证原型，还不是多 session 代理池。当前仍未实现：
+这是接入验证原型，还不是多 session 代理池。Python/SWIG 在真实节点收到 C++ `CONNECTED` 后仍发生控制线程调度阻塞，未通过真实连接验证。已成功跑通真实隧道、代理出口和停止路径的是独立 Go 控制器方案，见 `docs/OPENVPN3_GO.md`。当前仍未实现：
 
 - 一个 Python 进程中的多 TUN 生命周期管理；
 - `session-xxx-t-minutes` 解析与粘滞映射；

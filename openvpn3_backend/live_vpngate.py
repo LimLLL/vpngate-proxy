@@ -58,7 +58,7 @@ def load_candidates(limit: int, snapshot: Path | None = None) -> list[tuple[str,
     return candidates
 
 
-def command_ip(proxy: str | None = None, timeout: int = 10) -> str:
+def command_ip(proxy: str | None = None, timeout: int = 10, interface: str | None = None) -> str:
     errors: list[str] = []
     for url in ("http://api.ipify.org", "http://ip.sb"):
         command = ["curl", "--silent", "--show-error", "--fail", "--max-time", str(timeout)]
@@ -66,6 +66,8 @@ def command_ip(proxy: str | None = None, timeout: int = 10) -> str:
             command.extend(["--noproxy", "", "--proxy", proxy])
         else:
             command.extend(["--noproxy", "*"])
+        if interface:
+            command.extend(["--interface", interface])
         command.append(url)
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 2)
         value = result.stdout.strip()
@@ -76,17 +78,21 @@ def command_ip(proxy: str | None = None, timeout: int = 10) -> str:
     raise RuntimeError("Public IP request failed: " + " | ".join(errors))
 
 
-def prepare_policy_routing(device: str) -> None:
-    cleanup_policy_routing()
+def prepare_policy_routing(
+    device: str,
+    table: int = ROUTE_TABLE,
+    priority: int = RULE_PRIORITY,
+) -> None:
+    cleanup_policy_routing(table=table, priority=priority)
     subprocess.run(
-        ["ip", "route", "replace", "default", "dev", device, "table", str(ROUTE_TABLE)],
+        ["ip", "route", "replace", "default", "dev", device, "table", str(table)],
         check=True,
         timeout=5,
     )
     subprocess.run(
         [
-            "ip", "rule", "add", "priority", str(RULE_PRIORITY),
-            "oif", device, "table", str(ROUTE_TABLE),
+            "ip", "rule", "add", "priority", str(priority),
+            "oif", device, "table", str(table),
         ],
         check=True,
         timeout=5,
@@ -100,14 +106,14 @@ def prepare_policy_routing(device: str) -> None:
         )
 
 
-def cleanup_policy_routing() -> None:
+def cleanup_policy_routing(table: int = ROUTE_TABLE, priority: int = RULE_PRIORITY) -> None:
     subprocess.run(
-        ["ip", "rule", "del", "priority", str(RULE_PRIORITY)],
+        ["ip", "rule", "del", "priority", str(priority)],
         capture_output=True,
         timeout=5,
     )
     subprocess.run(
-        ["ip", "route", "flush", "table", str(ROUTE_TABLE)],
+        ["ip", "route", "flush", "table", str(table)],
         capture_output=True,
         timeout=5,
     )
