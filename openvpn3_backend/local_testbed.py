@@ -115,7 +115,12 @@ def local_testbed(workdir: Path, maximum: int) -> Iterator[Testbed]:
             "-subj", f"/CN=vpngate-benchmark-{name}", "-keyout", str(key), "-out", str(request),
         ], check=True, capture_output=True, timeout=20)
         extension = private / f"{name}.ext"
-        extension.write_text(f"extendedKeyUsage={usage}\n", encoding="utf-8")
+        extension.write_text(
+            "basicConstraints=critical,CA:FALSE\n"
+            "keyUsage=critical,digitalSignature,keyEncipherment\n"
+            f"extendedKeyUsage=critical,{usage}\n",
+            encoding="utf-8",
+        )
         sign = [
             "openssl", "x509", "-req", "-days", "1", "-in", str(request),
             "-CA", str(ca_crt), "-CAkey", str(ca_key), "-out", str(certificate),
