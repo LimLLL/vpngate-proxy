@@ -1,0 +1,74 @@
+name: OpenVPN 3 Core binding
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/openvpn3-core.yml"
+      - "openvpn3_backend/**"
+      - "mirror/vpngate.csv"
+      - "snapshot_utils.py"
+  workflow_dispatch:
+    inputs:
+      live_test:
+        description: Also connect to VPNGate and verify the existing SOCKS5 proxy end to end
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  OPENVPN3_COMMIT: 0b27d9df493db8bc9dc459a2b1cb6b67037742b2
+
+jobs:
+  python-cpp:
+    name: Build official C++ Core and call it from Python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates cmake curl g++ git iproute2 ninja-build pkg-config \
+            libasio-dev libcap-dev libfmt-dev liblz4-dev libjsoncpp-dev \
+            libssl-dev libxxhash-dev python3-dev swig
+
+      - name: Check out the pinned official OpenVPN 3 Core source
+        run: |
+          source_dir="${RUNNER_TEMP}/openvpn3-core"
+          git init "${source_dir}"
+          git -C "${source_dir}" remote add origin https://github.com/OpenVPN/openvpn3.git
+          git -C "${source_dir}" fetch --depth 1 origin "${OPENVPN3_COMMIT}"
+          git -C "${source_dir}" checkout --detach FETCH_HEAD
+          git -C "${source_dir}" rev-parse HEAD
+
+      - name: Build the official SWIG Python binding
+        run: |
+          source_dir="${RUNNER_TEMP}/openvpn3-core"
+          build_dir="${RUNNER_TEMP}/openvpn3-build"
+          cmake -S "${source_dir}" -B "${build_dir}" -GNinja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build "${build_dir}" --target ovpnclilib --parallel 2
+          find "${build_dir}/client" -maxdepth 2 -type f -print
+          echo "PYTHONPATH=${build_dir}/client:${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+
+      - name: Test native helpers, profile parsing and Python callbacks
+        run: python3 -m unittest discover -s openvpn3_backend/tests -p 'test_core.py' -v
+
+      - name: Run the existing Python test suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Prepare TUN for the live VPNGate test
+        if: github.event_name == 'workflow_dispatch' && inputs.live_test
+        run: |
+          sudo modprobe tun
+          test -c /dev/net/tun
+
+      - name: Connect with C++ Core and proxy traffic through its TUN
+        if: github.event_name == 'workflow_dispatch' && inputs.live_test
+        run: sudo --preserve-env=PYTHONPATH python3 -m openvpn3_backend.live_vpngate --attempts 12
