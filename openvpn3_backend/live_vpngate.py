@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import ipaddress
 import json
 import os
@@ -25,20 +26,26 @@ RULE_PRIORITY = 32103
 PROXY_PORT = 17928
 
 
-def load_candidates(limit: int) -> list[tuple[str, str]]:
-    text = ""
-    request = urllib.request.Request(API_URL, headers={"User-Agent": "vpngate-proxy-openvpn3-smoke/1"})
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            payload = response.read(MAX_SNAPSHOT_BYTES + 1)
-        if len(payload) > MAX_SNAPSHOT_BYTES:
-            raise ValueError("VPNGate response is too large")
-        text = payload.decode("utf-8")
-        parse_and_validate_snapshot(text, max_rows=1)
-        print("Using the live VPNGate API snapshot", flush=True)
-    except Exception as exc:
-        print(f"Live VPNGate API unavailable, using bundled snapshot: {exc}", flush=True)
-        text = (ROOT / "mirror" / "vpngate.csv").read_text(encoding="utf-8")
+def load_candidates(limit: int, snapshot: Path | None = None) -> list[tuple[str, str]]:
+    if snapshot and snapshot.exists():
+        text = snapshot.read_text(encoding="utf-8")
+        print(f"Using the shared VPNGate snapshot: {snapshot}", flush=True)
+    else:
+        text = ""
+        request = urllib.request.Request(API_URL, headers={"User-Agent": "vpngate-proxy-openvpn3-smoke/1"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                payload = response.read(MAX_SNAPSHOT_BYTES + 1)
+            if len(payload) > MAX_SNAPSHOT_BYTES:
+                raise ValueError("VPNGate response is too large")
+            text = payload.decode("utf-8")
+            parse_and_validate_snapshot(text, max_rows=1)
+            print("Using the live VPNGate API snapshot", flush=True)
+        except Exception as exc:
+            print(f"Live VPNGate API unavailable, using bundled snapshot: {exc}", flush=True)
+            text = (ROOT / "mirror" / "vpngate.csv").read_text(encoding="utf-8")
+        if snapshot:
+            snapshot.write_text(text, encoding="utf-8")
 
     rows = parse_and_validate_snapshot(text, max_rows=max(30, limit * 3))
     rows.sort(key=lambda row: int(row.get("Ping") or 999999))
@@ -209,7 +216,11 @@ def main() -> None:
     parser.add_argument("--attempts", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--backend", choices=("core", "cli"), default="core")
+    parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--stack-dump-after", type=float, default=25)
     args = parser.parse_args()
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(args.stack_dump_after, repeat=True)
     if os.geteuid() != 0:
         raise SystemExit("The live test must run as root in the dedicated GitHub Actions runner")
     if args.attempts < 1 or args.timeout < 1:
@@ -225,7 +236,7 @@ def main() -> None:
 
     start_proxy()
     failures: list[dict[str, Any]] = []
-    for label, profile in load_candidates(args.attempts):
+    for label, profile in load_candidates(args.attempts, args.snapshot):
         print(f"Trying {label} through {args.backend}", flush=True)
         result = probe_candidate(args.backend, label, profile, args.timeout, direct_ip)
         if result["connected"]:

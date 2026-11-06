@@ -211,8 +211,10 @@ class VPNConnection:
         return f"{label}: {message}"
 
     def _on_event(self, event: Any) -> None:
+        event_name = str(event.name)
+        print(f"[core-callback {threading.get_native_id()}] event enter {event_name}", flush=True)
         item = {
-            "name": str(event.name),
+            "name": event_name,
             "info": str(event.info),
             "error": bool(event.error),
             "fatal": bool(event.fatal),
@@ -221,8 +223,10 @@ class VPNConnection:
             self._events.append(item)
             if event.fatal:
                 self._fatal_error = f"{event.name}: {event.info}"
-        if event.name == "CONNECTED":
+        if event_name == "CONNECTED":
+            print(f"[core-callback {threading.get_native_id()}] before connection_info", flush=True)
             native_info = self._client.connection_info()
+            print(f"[core-callback {threading.get_native_id()}] after connection_info", flush=True)
             with self._state_lock:
                 self._connection_info = {
                     key: str(getattr(native_info, key))
@@ -240,6 +244,7 @@ class VPNConnection:
                     )
                 }
             self._connected.set()
+        print(f"[core-callback {threading.get_native_id()}] event exit {event_name}", flush=True)
 
     def _on_acc_event(self, event: Any) -> None:
         with self._state_lock:

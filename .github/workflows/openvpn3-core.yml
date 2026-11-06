@@ -74,8 +74,8 @@ jobs:
 
       - name: Connect with C++ Core and proxy traffic through its TUN
         if: github.event_name == 'workflow_dispatch' && inputs.live_test
-        run: sudo --preserve-env=PYTHONPATH python3 -m openvpn3_backend.live_vpngate --backend core --attempts 4
+        run: sudo --preserve-env=PYTHONPATH timeout --signal=TERM --kill-after=5s 75s python3 -m openvpn3_backend.live_vpngate --backend core --attempts 1 --timeout 10 --stack-dump-after 25 --snapshot "${RUNNER_TEMP}/vpngate-live.csv"
 
       - name: Retry the same check through the OpenVPN 2.x CLI
         if: always() && github.event_name == 'workflow_dispatch' && inputs.live_test
-        run: sudo --preserve-env=PYTHONPATH python3 -m openvpn3_backend.live_vpngate --backend cli --attempts 4
+        run: sudo --preserve-env=PYTHONPATH timeout --signal=TERM --kill-after=5s 75s python3 -m openvpn3_backend.live_vpngate --backend cli --attempts 1 --timeout 10 --stack-dump-after 25 --snapshot "${RUNNER_TEMP}/vpngate-live.csv"
