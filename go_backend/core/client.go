@@ -2,6 +2,7 @@
 package core
 
 /*
+#cgo CFLAGS: -I${SRCDIR}/..
 #cgo LDFLAGS: -lvpngate_bridge
 #include "bridge.h"
 #include <stdlib.h>
