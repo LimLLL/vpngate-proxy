@@ -58,7 +58,7 @@ jobs:
         run: go test -race ./...
         working-directory: go_backend
         env:
-          CGO_LDFLAGS: -L${RUNNER_TEMP}/go-bridge-build -Wl,-rpath,${RUNNER_TEMP}/go-bridge-build
+          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
 
       - name: Prepare TUN and fetch a candidate for the live test
         if: github.event_name == 'workflow_dispatch' && inputs.live_test
@@ -75,14 +75,14 @@ jobs:
         working-directory: go_backend
         env:
           VPNGATE_TEST_PROFILE: ${{ runner.temp }}/candidate.ovpn
-          CGO_LDFLAGS: -L${RUNNER_TEMP}/go-bridge-build -Wl,-rpath,${RUNNER_TEMP}/go-bridge-build
+          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
 
       - name: Compile the race-enabled Go connection probe
         if: github.event_name == 'workflow_dispatch' && inputs.live_test
         run: go build -race -o "${RUNNER_TEMP}/vpngate-go-probe" ./cmd/probe
         working-directory: go_backend
         env:
-          CGO_LDFLAGS: -L${RUNNER_TEMP}/go-bridge-build -Wl,-rpath,${RUNNER_TEMP}/go-bridge-build
+          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
 
       - name: Connect, verify proxy traffic and stop with Go plus C++ Core
         if: github.event_name == 'workflow_dispatch' && inputs.live_test
