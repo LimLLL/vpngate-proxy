@@ -7,6 +7,7 @@ from openvpn3_backend.core import (
     OpenVPN3Error,
     VPNConnection,
     evaluate_profile,
+    make_config,
     native_crypto_self_test,
     native_platform,
     prepare_profile,
@@ -54,6 +55,10 @@ class NativeHelperTests(unittest.TestCase):
         # openvpn/crypto/selftest.hpp disables the OpenSSL call in this build.
         # Empty output is the upstream contract, not a passing crypto self-test.
         self.assertEqual(native_crypto_self_test(), "")
+
+    def test_autologin_sessions_do_not_hide_external_credentials(self) -> None:
+        config = make_config(sample_profile(), connect_timeout=10)
+        self.assertFalse(config.autologinSessions)
 
     def test_cpp_parser_reads_a_real_vpngate_profile(self) -> None:
         result = evaluate_profile(sample_profile())

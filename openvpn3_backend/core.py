@@ -40,6 +40,9 @@ def make_config(profile: str, connect_timeout: int) -> Any:
     config.content = profile
     config.connTimeout = connect_timeout
     config.tunPersist = False
+    # Otherwise a profile without auth-user-pass locks empty default creds,
+    # causing submit_creds() to ignore the VPNGate credentials provided below.
+    config.autologinSessions = False
     config.compressionMode = "no"
     # VPNGate still publishes legacy AES-CBC profiles alongside modern ones.
     config.enableLegacyAlgorithms = True
