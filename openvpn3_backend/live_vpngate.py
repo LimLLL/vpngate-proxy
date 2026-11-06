@@ -1,4 +1,4 @@
-"""GitHub Actions-only live check: C++ Core tunnel plus the existing proxy."""
+"""GitHub Actions-only live check of a selected backend and the existing proxy."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .core import VPNConnection
 from proxy_server import start_proxy_server
 from snapshot_utils import MAX_SNAPSHOT_BYTES, decode_config, parse_and_validate_snapshot
 
@@ -123,21 +122,59 @@ def start_proxy() -> None:
     raise RuntimeError("Local proxy did not start listening")
 
 
-def probe_candidate(label: str, profile: str, timeout: int, direct_ip: str | None) -> dict[str, Any]:
-    connection = VPNConnection(profile, connect_timeout=timeout, device="tun0")
+def wait_with_progress(label: str, connection: Any, timeout: int) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    event_cursor = 0
+    last_log = ""
+    while time.monotonic() < deadline:
+        try:
+            info = connection.wait_connected(min(1.0, max(0.01, deadline - time.monotonic())))
+            print(f"[{label}] CONNECTED: {info}", flush=True)
+            return info
+        except TimeoutError:
+            events = connection.events
+            for event in events[event_cursor:]:
+                print(f"[{label}] event: {event}", flush=True)
+            event_cursor = len(events)
+            logs = connection.logs
+            if logs and logs[-1] != last_log:
+                last_log = logs[-1]
+                print(f"[{label}] native: {last_log}", flush=True)
+        except Exception:
+            print(f"[{label}] native failure events={connection.events} logs={connection.logs[-12:]}", flush=True)
+            raise
+    raise TimeoutError(f"{label} did not become ready within {timeout}s")
+
+
+def probe_candidate(
+    backend: str,
+    label: str,
+    profile: str,
+    timeout: int,
+    direct_ip: str | None,
+) -> dict[str, Any]:
+    if backend == "core":
+        from .core import VPNConnection as Connection
+    else:
+        from .cli_backend import CLIConnection as Connection
+    connection = Connection(profile, connect_timeout=timeout, device="tun0")
     result: dict[str, Any] = {}
     try:
         started = time.monotonic()
+        print(f"[{label}] entering {backend} start/eval_config", flush=True)
         connection.start()
-        info = connection.wait_connected(timeout + 10)
+        print(f"[{label}] start returned; waiting for CONNECTED", flush=True)
+        info = wait_with_progress(label, connection, timeout + 10)
         connect_ms = round((time.monotonic() - started) * 1000)
         if info.get("tunName") != "tun0":
             raise RuntimeError(f"Unexpected TUN name: {info.get('tunName')!r}")
+        print(f"[{label}] configuring policy routing and checking proxy", flush=True)
         prepare_policy_routing("tun0")
         proxy_ip = command_ip(f"socks5h://127.0.0.1:{PROXY_PORT}")
         if direct_ip and proxy_ip == direct_ip:
             raise RuntimeError("Proxy IP matches the direct IP; traffic did not use the VPN exit")
         result = {
+            "backend": backend,
             "node": label,
             "connected": True,
             "connect_ms": connect_ms,
@@ -148,6 +185,7 @@ def probe_candidate(label: str, profile: str, timeout: int, direct_ip: str | Non
         }
     except Exception as exc:
         result = {
+            "backend": backend,
             "node": label,
             "connected": False,
             "error": str(exc),
@@ -155,9 +193,14 @@ def probe_candidate(label: str, profile: str, timeout: int, direct_ip: str | Non
             "events": connection.events,
             "logs": connection.logs[-12:],
         }
+        # Emit the handshake error before stop(), so a stopping bug cannot hide it.
+        print(json.dumps(result, ensure_ascii=False), flush=True)
     finally:
+        print(f"[{label}] removing policy routes", flush=True)
         cleanup_policy_routing()
+        print(f"[{label}] stopping native connection", flush=True)
         connection.close()
+        print(f"[{label}] stop completed", flush=True)
     return result
 
 
@@ -165,6 +208,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--attempts", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=20)
+    parser.add_argument("--backend", choices=("core", "cli"), default="core")
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise SystemExit("The live test must run as root in the dedicated GitHub Actions runner")
@@ -182,8 +226,8 @@ def main() -> None:
     start_proxy()
     failures: list[dict[str, Any]] = []
     for label, profile in load_candidates(args.attempts):
-        print(f"Trying {label} through the official C++ Core", flush=True)
-        result = probe_candidate(label, profile, args.timeout, direct_ip)
+        print(f"Trying {label} through {args.backend}", flush=True)
+        result = probe_candidate(args.backend, label, profile, args.timeout, direct_ip)
         if result["connected"]:
             print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2), flush=True)
             return

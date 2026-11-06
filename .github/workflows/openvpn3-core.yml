@@ -70,7 +70,12 @@ jobs:
         run: |
           sudo modprobe tun
           test -c /dev/net/tun
+          sudo apt-get install -y --no-install-recommends openvpn
 
       - name: Connect with C++ Core and proxy traffic through its TUN
         if: github.event_name == 'workflow_dispatch' && inputs.live_test
-        run: sudo --preserve-env=PYTHONPATH python3 -m openvpn3_backend.live_vpngate --attempts 12
+        run: sudo --preserve-env=PYTHONPATH python3 -m openvpn3_backend.live_vpngate --backend core --attempts 4
+
+      - name: Retry the same check through the OpenVPN 2.x CLI
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.live_test
+        run: sudo --preserve-env=PYTHONPATH python3 -m openvpn3_backend.live_vpngate --backend cli --attempts 4

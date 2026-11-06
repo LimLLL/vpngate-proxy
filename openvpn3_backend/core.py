@@ -9,6 +9,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from .profiles import prepare_profile
+
 try:
     import ovpncli
 except ImportError as exc:
@@ -31,39 +33,6 @@ class ProfileEvaluation:
     remote_proto: str
     autologin: bool
     profile_name: str
-
-
-def prepare_profile(profile: str, device: str | None = None) -> str:
-    """Keep the host routing table unchanged and optionally pin the TUN name."""
-    lines: list[str] = []
-    inline_block = False
-    route_nopull_seen = False
-    dev_seen = False
-    for raw_line in profile.replace("\r\n", "\n").splitlines():
-        stripped = raw_line.strip()
-        lowered = stripped.lower()
-        if inline_block:
-            lines.append(raw_line)
-            if lowered.startswith("</"):
-                inline_block = False
-            continue
-        if lowered.startswith("<") and not lowered.startswith("</"):
-            inline_block = True
-            lines.append(raw_line)
-            continue
-        parts = stripped.split()
-        directive = parts[0].lower() if parts else ""
-        if directive == "route-nopull":
-            route_nopull_seen = True
-        if device and directive == "dev":
-            raw_line = f"dev {device}"
-            dev_seen = True
-        lines.append(raw_line)
-    if device and not dev_seen:
-        lines.append(f"dev {device}")
-    if not route_nopull_seen:
-        lines.append("route-nopull")
-    return "\n".join(lines) + "\n"
 
 
 def make_config(profile: str, connect_timeout: int) -> Any:
@@ -303,11 +272,29 @@ class VPNConnection:
 
     def close(self, timeout: float = 10) -> None:
         thread = self._thread
-        if thread and thread.is_alive():
-            self._client.stop()
-            thread.join(timeout)
-            if thread.is_alive():
-                raise TimeoutError("OpenVPN 3 Core did not stop within the deadline")
+        if not thread or not thread.is_alive():
+            return
+        deadline = time.monotonic() + timeout
+        stop_errors: list[Exception] = []
+
+        def request_stop() -> None:
+            try:
+                self._client.stop()
+            except Exception as exc:
+                stop_errors.append(exc)
+
+        # SWIG blocks inside some native calls; even the stop request must
+        # have a bounded caller instead of hanging the whole Python process.
+        stopper = threading.Thread(target=request_stop, name="openvpn3-core-stop", daemon=True)
+        stopper.start()
+        stopper.join(min(5.0, timeout))
+        if stopper.is_alive():
+            raise TimeoutError("OpenVPN 3 Core stop request did not return within 5s")
+        if stop_errors:
+            raise OpenVPN3Error(f"Native stop raised: {stop_errors[0]}")
+        thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            raise TimeoutError("OpenVPN 3 Core did not stop within the deadline")
 
     def __enter__(self) -> VPNConnection:
         self.start()
