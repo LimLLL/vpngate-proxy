@@ -91,9 +91,14 @@ def _connect_cli(index: int, profile: str, connection: CLIConnection) -> dict[st
             "observed_ready_ms": round((time.monotonic() - started) * 1000, 3),
             "info": info,
         }
-    except Exception:
-        connection.close()
-        raise
+    except Exception as exc:
+        # Keep the native error after the higher-level readiness timeout.
+        diagnostic = " | ".join(connection.logs[-8:])
+        try:
+            connection.close()
+        except Exception as cleanup_error:
+            raise RuntimeError(f"tun{index}: {diagnostic}; cleanup failed: {cleanup_error}") from exc
+        raise RuntimeError(f"tun{index}: {diagnostic}") from exc
 
 
 def cli_connected(profiles: list[Path]) -> tuple[list[CLIConnection], dict[str, Any]]:
@@ -198,7 +203,7 @@ def run_go(profiles: list[Path], case_dir: Path, go_binary: Path, direct_ip: str
             deadline = time.monotonic() + 45
             while not ready_file.exists():
                 if process.poll() is not None:
-                    raise RuntimeError(f"Go benchmark exited with {process.returncode}")
+                    raise RuntimeError("Go benchmark exited before all tunnels were ready")
                 if time.monotonic() > deadline:
                     raise TimeoutError("Go tunnels did not all become ready within 45s")
                 time.sleep(0.25)
@@ -270,7 +275,7 @@ def main() -> None:
                 if backend == "go" and report_file.exists():
                     report = json.loads(report_file.read_text(encoding="utf-8"))
                 report["stage"] = "failed"
-                report["errors"] = [str(exc)]
+                report.setdefault("errors", []).append(str(exc))
                 failures = True
             write_json(case_dir / "final.json", report)
             results.append(report)

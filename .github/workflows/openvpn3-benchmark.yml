@@ -72,6 +72,20 @@ jobs:
             --go-binary "${RUNNER_TEMP}/vpngate-go-benchmark" \
             "${benchmark_args[@]}"
 
+      - name: Make sudo-generated diagnostics readable and print failures
+        if: '!cancelled()'
+        run: |
+          results="${RUNNER_TEMP}/vpngate-benchmark"
+          if test -d "${results}"; then
+            sudo chmod -R a+rX "${results}"
+            for log_file in "${results}"/go-*/go.log; do
+              if test -f "${log_file}"; then
+                printf '\n===== %s =====\n' "${log_file}"
+                cat "${log_file}"
+              fi
+            done
+          fi
+
       - name: Upload reports and native failure logs
         if: '!cancelled()'
         uses: actions/upload-artifact@v7
