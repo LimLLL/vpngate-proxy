@@ -14,6 +14,7 @@ from openvpn3_backend.core import (
     native_platform,
     prepare_profile,
 )
+from openvpn3_backend.live_vpngate import ping_sort_key
 from snapshot_utils import parse_and_validate_snapshot
 
 
@@ -73,6 +74,12 @@ class NativeHelperTests(unittest.TestCase):
         result = evaluate_profile("this is not an OpenVPN profile\n")
         self.assertTrue(result.error)
         self.assertTrue(result.message)
+
+
+class CandidateOrderingTests(unittest.TestCase):
+    def test_unknown_ping_values_are_ranked_last(self) -> None:
+        rows = [{"Ping": "-"}, {"Ping": "25"}, {}, {"Ping": "5"}, {"Ping": "-1"}]
+        self.assertEqual(sorted(rows, key=ping_sort_key), [{"Ping": "5"}, {"Ping": "25"}, {"Ping": "-"}, {}, {"Ping": "-1"}])
 
 
 class ProcessMetricTests(unittest.TestCase):

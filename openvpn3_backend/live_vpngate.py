@@ -17,6 +17,7 @@ from typing import Any
 
 from proxy_server import start_proxy_server
 from snapshot_utils import MAX_SNAPSHOT_BYTES, decode_config, parse_and_validate_snapshot
+from vpn_utils import _safe_int
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,12 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 ROUTE_TABLE = 103
 RULE_PRIORITY = 32103
 PROXY_PORT = 17928
+
+
+def ping_sort_key(row: dict[str, Any]) -> int:
+    """Rank missing and non-numeric public Ping values after known latencies."""
+    latency = _safe_int(row.get("Ping"), 999999)
+    return latency if latency >= 0 else 999999
 
 
 def load_candidates(limit: int, snapshot: Path | None = None) -> list[tuple[str, str]]:
@@ -48,7 +55,7 @@ def load_candidates(limit: int, snapshot: Path | None = None) -> list[tuple[str,
             snapshot.write_text(text, encoding="utf-8")
 
     rows = parse_and_validate_snapshot(text, max_rows=max(30, limit * 3))
-    rows.sort(key=lambda row: int(row.get("Ping") or 999999))
+    rows.sort(key=ping_sort_key)
     candidates: list[tuple[str, str]] = []
     for row in rows:
         label = f"{row['CountryShort']}-{row['IP']}"
