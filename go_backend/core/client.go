@@ -7,9 +7,11 @@ package core
 #include "bridge.h"
 #include <stdlib.h>
 
-extern void vpngateGoEvent(uint32_t id, const char *name, const char *info,
+// cgo's export header declares C string inputs as char*, not const char*.
+// The native callbacks remain const char* and these inputs are only read.
+extern void vpngateGoEvent(uint32_t id, char *name, char *info,
                            int error, int fatal);
-extern void vpngateGoLog(uint32_t id, const char *text);
+extern void vpngateGoLog(uint32_t id, char *text);
 */
 import "C"
 
