@@ -54,7 +54,14 @@ def cleanup_network(namespace: str, physical_link: str, processes: list[subproce
                 # An owned worker may exit between enumeration and cleanup.
                 continue
         subprocess.run(["ip", "netns", "del", namespace], check=True, capture_output=True, timeout=5)
-        subprocess.run(["ip", "link", "delete", physical_link], check=True, capture_output=True, timeout=5)
+        # Deleting the namespace can also delete the virtual veth pair, unlike
+        # a physical NIC moved back to the root namespace.
+        if Path(f"/sys/class/net/{physical_link}").exists():
+            result = subprocess.run(
+                ["ip", "link", "delete", physical_link], capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                errors.append(f"Remove veth {physical_link}: {result.stderr.strip()}")
     except Exception as exc:
         errors.append(str(exc))
     if errors:
@@ -66,7 +73,11 @@ def check_server(process: subprocess.Popen[str], log_path: Path) -> None:
         if log_path.exists() and "Initialization Sequence Completed" in log_path.read_text(encoding="utf-8"):
             return
         if process.poll() is not None:
-            raise RuntimeError(f"Local OpenVPN server exited with {process.returncode} before initialization")
+            log = log_path.read_text(encoding="utf-8") if log_path.exists() else "no server log"
+            tail = "\n".join(log.splitlines()[-12:])
+            raise RuntimeError(
+                f"Local OpenVPN server exited with {process.returncode} before initialization:\n{tail}"
+            )
         time.sleep(0.1)
     raise TimeoutError("Local OpenVPN server did not finish initialization")
 
@@ -132,6 +143,7 @@ proto udp
 dev tun10
 topology subnet
 server 10.66.0.0 255.255.255.0
+dh none
 ca {ca_crt}
 cert {private / 'server.crt'}
 key {private / 'server.key'}
