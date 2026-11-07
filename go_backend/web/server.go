@@ -241,49 +241,50 @@ func decodeBody(r *http.Request, maximum int) (map[string]requestValue, error) {
 	if err != nil || len(data) > maximum {
 		return nil, errors.New("invalid or oversized JSON request")
 	}
-	if err != nil {
-		return nil, err
-	}
-	output := make(map[string]requestValue)
 	if len(data) == 0 {
-		return output, nil
+		return map[string]requestValue{}, nil
 	}
+	var decoded map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.UseNumber()
-	if err := decoder.Decode(&output); err != nil {
+	if err := decoder.Decode(&decoded); err != nil {
 		return nil, err
+	}
+	output := make(map[string]requestValue, len(decoded))
+	for key, value := range decoded {
+		output[key] = requestValue{value: value}
 	}
 	return output, nil
 }
 
-type requestValue = any
+type requestValue struct{ value any }
 
 func (v requestValue) text() string {
-	if v == nil {
+	if v.value == nil {
 		return ""
 	}
-	return fmt.Sprint(v)
+	return fmt.Sprint(v.value)
 }
 
 func (v requestValue) integer() int {
-	switch v := v.(type) {
+	switch value := v.value.(type) {
 	case json.Number:
-		result, err := v.Int64()
+		result, err := value.Int64()
 		if err == nil {
 			return int(result)
 		}
 	case float64:
-		return int(v)
+		return int(value)
 	case string:
 		var result int
-		_, _ = fmt.Sscanf(v, "%d", &result)
+		_, _ = fmt.Sscanf(value, "%d", &result)
 		return result
 	}
 	return 0
 }
 
 func (v requestValue) strings() []any {
-	if result, ok := v.([]any); ok {
+	if result, ok := v.value.([]any); ok {
 		return result
 	}
 	return nil
