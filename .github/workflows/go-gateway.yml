@@ -6,6 +6,7 @@ on:
   push:
     paths:
       - "go_backend/**"
+      - "scripts/test_session_gateway.sh"
       - ".github/workflows/go-gateway.yml"
   workflow_dispatch: {}
 env:
@@ -31,7 +32,7 @@ jobs:
           source_dir="${RUNNER_TEMP}/openvpn3-core"
           git init "${source_dir}"
           git -C "${source_dir}" remote add origin https://github.com/OpenVPN/openvpn3.git
-          git -C "${source_dir}" fetch --depth 1 origin "${OPENVPN3_COMMIT}"
+          git -C "${source_dir}" fetch --depth 1 origin master
           git -C "${source_dir}" checkout --detach FETCH_HEAD
           test "$(git -C "${source_dir}" rev-parse HEAD)" = "${OPENVPN3_COMMIT}"
       - name: Build the C ABI bridge and official Core with the verified settings
@@ -50,3 +51,21 @@ jobs:
           go run ./cmd/mirror --fixture "${GITHUB_WORKSPACE}/mirror/vpngate.csv" --output-dir "${RUNNER_TEMP}/go-mirror"
           grep -q '"row_count":' "${RUNNER_TEMP}/go-mirror/vpngate.meta.json"
           cmp "${GITHUB_WORKSPACE}/mirror/vpngate.csv" "${RUNNER_TEMP}/go-mirror/vpngate.csv"
+
+      - name: Validate sticky, TTL and concurrent native sessions over real TUNs
+        env:
+          CGO_ENABLED: "1"
+          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
+          LD_LIBRARY_PATH: ${{ runner.temp }}/go-bridge-build
+          VPNGATE_E2E_PROFILE_GLOB: ${{ runner.temp }}/go-session-test/profiles/*.ovpn
+          VPNGATE_SESSION_REPORT: ${{ runner.temp }}/go-session-report.json
+        run: sudo --preserve-env=PATH,CGO_ENABLED,CGO_LDFLAGS,LD_LIBRARY_PATH,VPNGATE_E2E_PROFILE_GLOB,VPNGATE_SESSION_REPORT bash scripts/test_session_gateway.sh
+
+      - name: Publish the controlled session verification report
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v7
+        with:
+          if-no-files-found: error
+          name: controlled-session-${{ github.run_number }}
+          retention-days: 14
+          path: ${{ runner.temp }}/go-session-report.json

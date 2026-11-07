@@ -134,7 +134,11 @@ func (s *Source) load(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("read %s: %w", path, err)
 			}
-			s.nodes = append(s.nodes, Candidate{ID: filepath.Base(path), Profile: string(data)})
+			host, port, protocol := parseRemote(string(data), "")
+			s.nodes = append(s.nodes, Candidate{
+				ID: ParsePublicID(filepath.Base(path)), IP: host, Country: "XX", CountryName: "Local profile",
+				RemoteHost: host, RemotePort: port, Protocol: protocol, Profile: string(data),
+			})
 		}
 		sort.SliceStable(s.nodes, func(i, j int) bool { return s.nodes[i].ID < s.nodes[j].ID })
 		return nil

@@ -36,7 +36,8 @@ type Proxy struct {
 	wg         sync.WaitGroup
 	MaxConns   chan struct{}
 	// Enabled can reject new proxy traffic after a management-level stop.
-	Enabled func() bool
+	Enabled        func() bool
+	DialerForLease func(*Lease) (LeaseDialer, error)
 }
 
 func NewProxy(parent context.Context, pool *Pool, password string, maxConnections int) (*Proxy, error) {
@@ -170,12 +171,19 @@ func (p *Proxy) acquireTunnel(ctx context.Context, username, password string) (*
 	if err != nil {
 		return nil, nil, err
 	}
-	dialer := DeviceDialer{Device: lease.Info.TUNName, DNS: "8.8.8.8"}
-	if dialer.Device == "" {
+	if p.DialerForLease != nil {
+		dialer, err := p.DialerForLease(lease)
+		if err != nil {
+			lease.Release()
+			return nil, nil, err
+		}
+		return lease, dialer, nil
+	}
+	if lease.Info.TUNName == "" {
 		lease.Release()
 		return nil, nil, errors.New("session has no tunnel interface")
 	}
-	return lease, dialer, nil
+	return lease, DeviceDialer{Device: lease.Info.TUNName, DNS: "8.8.8.8"}, nil
 }
 
 func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {

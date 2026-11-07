@@ -53,7 +53,8 @@ jobs:
           source_dir="${RUNNER_TEMP}/openvpn3-core"
           git init "${source_dir}"
           git -C "${source_dir}" remote add origin https://github.com/OpenVPN/openvpn3.git
-          git -C "${source_dir}" fetch --depth 1 origin "${OPENVPN3_COMMIT}"
+          git -C "${source_dir}" fetch --depth 1 origin master
+          test "$(git -C "${source_dir}" rev-parse HEAD)" = "${OPENVPN3_COMMIT}"
           git -C "${source_dir}" checkout --detach FETCH_HEAD
           git -C "${source_dir}" rev-parse HEAD
 

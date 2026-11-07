@@ -1,0 +1,189 @@
+package gateway
+
+import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestControlledSessionGateway runs only when the isolated CI network has
+// supplied real native profiles. Default unit tests do not create privileged TUNs.
+func TestControlledSessionGateway(t *testing.T) {
+	pattern := os.Getenv("VPNGATE_E2E_PROFILE_GLOB")
+	if pattern == "" {
+		t.Skip("the controlled server workflow provides native profiles")
+	}
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		t.Fatal(err)
+	}
+	source, err := FileSource(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory, err := NewNativeFactory(NativeConfig{Source: source, Timeout: 20 * time.Second, Backoff: 250 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool, err := NewPool(ctx, PoolConfig{
+		MinSpare: 2, MaxTunnels: 8, CreateAttempts: 3,
+		ConnectTimeout: 30 * time.Second, IdleTimeout: 10 * time.Minute,
+		Factory: factory.Factory(), Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := pool.Close(); err != nil {
+			t.Errorf("controlled pool close: %v", err)
+		}
+	}()
+	proxy, err := NewProxy(ctx, pool, "test-password", 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- proxy.Serve(listener) }()
+
+	request := func(username string) string {
+		t.Helper()
+		proxyURL := &url.URL{Scheme: "http", Host: listener.Addr().String(),
+			User: url.UserPassword(username, "test-password")}
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: 45 * time.Second}
+		response, err := client.Get("http://10.66.0.1:18080/status")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		if readErr != nil || closeErr != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("proxy request %s: %s %q %v %v", username, response.Status, body, readErr, closeErr)
+		}
+		host, port, err := net.SplitHostPort(strings.TrimPrefix(strings.TrimSpace(string(body)), "vpn-client="))
+		if err != nil || !strings.HasPrefix(host, "10.66.0.") || port == "" {
+			t.Fatalf("response did not traverse the controlled VPN: %q %v", body, err)
+		}
+		return host
+	}
+	device := func(session string) string {
+		t.Helper()
+		_, _, sessions := pool.Status()
+		for _, status := range sessions {
+			if status.ID == session {
+				return status.Device
+			}
+		}
+		return ""
+	}
+
+	first := request("session-alpha-t-1")
+	second := request("session-alpha-t-1")
+	if first != second {
+		t.Fatalf("session changed before expiration: %q %q", first, second)
+	}
+	firstDevice := device("alpha")
+	if firstDevice == "" {
+		t.Fatal("alpha has no native TUN")
+	}
+	independentIP := request("session-beta-t-1")
+	if independentIP == first || device("beta") == firstDevice {
+		t.Fatalf("session beta did not receive an independent TUN: %s", independentIP)
+	}
+	_ = request("session-holding-t-1")
+	holdDevice := device("holding")
+	if holdDevice == "" || holdDevice == firstDevice {
+		t.Fatalf("holding stream has no independent endpoint: %s", holdDevice)
+	}
+	stream, reader := openHoldingCONNECT(t, listener.Addr().String())
+	defer stream.Close()
+	writePing := func() string {
+		t.Helper()
+		if _, err := io.WriteString(stream, "ping\n"); err != nil {
+			t.Fatal(err)
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		return line
+	}
+	firstEcho := writePing()
+	t.Logf("wait 62 seconds for a complete one-minute session TTL while a CONNECT remains active")
+	time.Sleep(62 * time.Second)
+	rotatedIP := request("session-alpha-t-1")
+	rotatedDevice := device("alpha")
+	if rotatedDevice == "" || rotatedDevice == firstDevice {
+		t.Fatalf("TTL did not rotate the native TUN: %s -> %s", firstDevice, rotatedDevice)
+	}
+	if got := writePing(); got != firstEcho {
+		t.Fatalf("the existing TCP upstream was silently reopened during TTL: %q -> %q", firstEcho, got)
+	}
+	if got := writePing(); got != firstEcho {
+		t.Fatalf("second post-TTL ping left the original stream: %q", got)
+	}
+	_ = stream.Close()
+	if err := proxy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+	report := map[string]any{
+		"tunneled_http": true, "sticky_before_ttl": first == second,
+		"fresh_tun_after_ttl":      rotatedDevice != firstDevice,
+		"existing_stream_survives": true,
+		"first_tun":                firstDevice, "rotated_tun": rotatedDevice,
+		"first_vpn_ip": first, "independent_vpn_ip": independentIP, "rotated_vpn_ip": rotatedIP,
+	}
+	if path := os.Getenv("VPNGATE_SESSION_REPORT"); path != "" {
+		data, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("controlled session report: %+v", report)
+}
+
+func openHoldingCONNECT(t *testing.T, proxyAddress string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	connection, err := net.DialTimeout("tcp", proxyAddress, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := base64.StdEncoding.EncodeToString([]byte("session-holding-t-1:test-password"))
+	request := fmt.Sprintf("CONNECT 10.66.0.1:18081 HTTP/1.1\r\nProxy-Authorization: Basic %s\r\n\r\n", credentials)
+	if _, err := io.WriteString(connection, request); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(connection)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("holding CONNECT failed: %s", response.Status)
+	}
+	return connection, reader
+}
