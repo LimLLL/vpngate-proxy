@@ -72,7 +72,7 @@ jobs:
           LD_LIBRARY_PATH: ${{ runner.temp }}/go-bridge-build
           VPNGATE_E2E_PROFILE_GLOB: ${{ runner.temp }}/go-session-test/profiles/*.ovpn
           VPNGATE_SESSION_REPORT: ${{ runner.temp }}/go-session-report.json
-        run: sudo --preserve-env=PATH,CGO_ENABLED,CGO_LDFLAGS,LD_LIBRARY_PATH,VPNGATE_E2E_PROFILE_GLOB,VPNGATE_SESSION_REPORT bash scripts/test_session_gateway.sh
+        run: sudo --preserve-env=PATH,RUNNER_TEMP,CGO_ENABLED,CGO_LDFLAGS,LD_LIBRARY_PATH,VPNGATE_E2E_PROFILE_GLOB,VPNGATE_SESSION_REPORT bash scripts/test_session_gateway.sh
 
       - name: Publish the controlled session verification report
         if: steps.session_validation.conclusion == 'success'
