@@ -8,6 +8,8 @@ on:
       - "go_backend/**"
       - ".github/workflows/go-gateway.yml"
   workflow_dispatch: {}
+env:
+  OPENVPN3_COMMIT: 0b27d9df493db8bc9dc459a2b1cb6b670377b2
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -19,24 +21,25 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.25.x"
-          cache-dependency-path: go_backend/go.sum
-      - name: Install native build dependencies
+          cache: false
+      - name: Install the verified native build dependencies
+        timeout-minutes: 5
         run: |
-          sudo install -d -m 700 /root/.config/pip
-          printf 'global:\nbreak-system-packages: true\n' | sudo tee /root/.config/pip/pip.conf > /dev/null
-          sudo -E sh -c 'retry() { for attempt in 1 2 3 4 5 6; do "$@" && return 0; sleep 15; done; return 1; }; retry apt-get update; retry env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential cmake pkg-config git libssl-dev liblz4-dev liblzo2-dev zlib1g-dev openvpn curl iproute2 iputils-ping'
-      - name: Build the pinned official OpenVPN 3 Core and C++ bridge
+          sudo -E sh -c 'retry() { for attempt in 1 2 3 4 5 6; do "$@" && return 0; sleep 15; done; return 1; }; retry apt-get update; retry env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates cmake curl g++ git iproute2 ninja-build openvpn pkg-config libasio-dev libcap-dev libfmt-dev liblz4-dev libjsoncpp-dev libssl-dev libxxhash-dev iputils-ping'
+      - name: Check out the pinned official OpenVPN 3 Core
         run: |
-          cmake -S go_backend -B "${RUNNER_TEMP}/go-bridge-build" \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DOPENVPN_EXTERNAL_TRANSPORT=ON
-          cmake --build "${RUNNER_TEMP}/go-bridge-build" --parallel 2
-          find "${RUNNER_TEMP}/go-bridge-build" -maxdepth 1 -name 'libvpngate_bridge*' -print
+          source_dir="${RUNNER_TEMP}/openvpn3-core"
+          git init "${source_dir}"
+          git -C "${source_dir}" remote add origin https://github.com/OpenVPN/openvpn3.git
+          git -C "${source_dir}" fetch --depth 1 origin "${OPENVPN3_COMMIT}"
+          git -C "${source_dir}" checkout --detach FETCH_HEAD
+          test "$(git -C "${source_dir}" rev-parse HEAD)" = "${OPENVPN3_COMMIT}"
+      - name: Build the C ABI bridge and official Core with the verified settings
+        run: cmake -S go_backend -B "${RUNNER_TEMP}/go-bridge-build" -GNinja -DCMAKE_BUILD_TYPE=Release -DOPENVPN3_SOURCE_DIR="${RUNNER_TEMP}/openvpn3-core" && cmake --build "${RUNNER_TEMP}/go-bridge-build" --parallel 2
       - name: Build, vet and test the complete Go gateway
         env:
           CGO_ENABLED: "1"
-          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build
-          CGO_CFLAGS: -I${{ github.workspace }}/go_backend
+          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
           LD_LIBRARY_PATH: ${{ runner.temp }}/go-bridge-build
           GOFLAGS: -buildvcs=false
         run: |
