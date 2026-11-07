@@ -61,7 +61,7 @@ func testProxy(t *testing.T) *Proxy {
 }
 
 func proxySessionAuth(session string) string {
-	return "Basic " + base64.StdEncoding.EncodeToString([]byte(session+":secret"))
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte("session-"+session+":secret"))
 }
 
 func TestHTTPRejectsMissingProxyCredentials(t *testing.T) {

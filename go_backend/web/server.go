@@ -409,7 +409,7 @@ func (s *Server) toggleFavorite(w http.ResponseWriter, body map[string]requestVa
 
 func (s *Server) refreshNodes(w http.ResponseWriter, body map[string]requestValue) {
 	if values, ok := body["discovery_countries"]; ok {
-		parts, ok := values.([]any)
+		parts := values.strings()
 		if !ok {
 			respondError(w, errors.New("国家筛选范围必须是国家代码数组"))
 			return
@@ -459,7 +459,7 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request, body map[stri
 	}
 	ids := make([]string, 0, len(values))
 	for _, value := range values {
-		ids = append(ids, value.text())
+		ids = append(ids, requestValue{value: value}.text())
 	}
 	if !s.Runtime.Catalog.TryMaintenance() {
 		respondError(w, errors.New("当前已有节点测试或维护任务"))
