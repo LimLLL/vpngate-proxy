@@ -39,8 +39,14 @@ jobs:
           git init "${source_dir}"
           git -C "${source_dir}" remote add origin https://github.com/OpenVPN/openvpn3.git
           git -C "${source_dir}" fetch --depth 1 origin master
-          git -C "${source_dir}" checkout --detach "${OPENVPN3_COMMIT}"
-          printf 'checked out Core HEAD: %s\n' "$(git -C "${source_dir}" rev-parse HEAD)"
+          git --version
+          git -C "${source_dir}" checkout --detach FETCH_HEAD
+          actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
+          printf 'Core HEAD: %s\nRequired Core: %s\n' "${actual_commit}" "${OPENVPN3_COMMIT}"
+          if [ "${actual_commit}" != "${OPENVPN3_COMMIT}" ]; then
+            printf 'The fetched Core is not the pinned revision\n' >&2
+            exit 1
+          fi
       - name: Build the C ABI bridge and official Core with the verified settings
         run: cmake -S go_backend -B "${RUNNER_TEMP}/go-bridge-build" -GNinja -DCMAKE_BUILD_TYPE=Release -DOPENVPN3_SOURCE_DIR="${RUNNER_TEMP}/openvpn3-core" && cmake --build "${RUNNER_TEMP}/go-bridge-build" --parallel 2
       - name: Build, vet and test the complete Go gateway
