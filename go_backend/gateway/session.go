@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -40,18 +39,4 @@ func ParseSession(username string) (SessionSpec, error) {
 // SameSession also protects a single ID from silently changing its TTL.
 func SameSession(a, b SessionSpec) bool {
 	return a.ID == b.ID && a.TTL == b.TTL
-}
-
-// ParsePublicID turns display-oriented suggestions into a valid session ID;
-// the prefix is supplied by the client-facing session template, not the VPN.
-func ParsePublicID(value string) string {
-	output := regexp.MustCompile(`[^a-zA-Z0-9_.-]`).ReplaceAllString(value, "_")
-	output = strings.Trim(output, "_.-")
-	if output == "" {
-		output = "default"
-	}
-	if len(output) > 120 {
-		output = output[:120]
-	}
-	return output
 }

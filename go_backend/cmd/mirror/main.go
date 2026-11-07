@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/LimLLL/vpngate-proxy/go_backend/gateway"
+	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
 const maxSnapshotSize = 12 * 1024 * 1024
@@ -103,7 +103,7 @@ func fetch(source string, timeout time.Duration) ([]byte, error) {
 }
 
 func validate(data []byte, source string) (mirrorMetadata, error) {
-	sourceReader := &gateway.Source{}
+	sourceReader := &nodes.Source{}
 	if err := sourceReader.LoadSnapshot(data); err != nil {
 		return mirrorMetadata{}, err
 	}

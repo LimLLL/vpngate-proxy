@@ -9,8 +9,8 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/update-vpngate-mirror.yml"
-      - "scripts/build_vpngate_mirror.py"
-      - "snapshot_utils.py"
+      - "go_backend/cmd/mirror/**"
+      - "go_backend/nodes/**"
 
 permissions:
   contents: read
@@ -29,11 +29,15 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-go@v6
         with:
-          python-version: "3.11"
-      - name: Fetch and validate VPNGate snapshot
-        run: python scripts/build_vpngate_mirror.py --output-dir _site
+          go-version: "1.25.x"
+          cache: false
+      - name: Fetch and validate VPNGate snapshot with Go
+        working-directory: go_backend
+        env:
+          CGO_ENABLED: "0"
+        run: go run ./cmd/mirror --output-dir "${GITHUB_WORKSPACE}/_site"
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
