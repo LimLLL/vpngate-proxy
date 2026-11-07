@@ -256,7 +256,7 @@ func decodeBody(r *http.Request, maximum int) (map[string]requestValue, error) {
 	return output, nil
 }
 
-type requestValue any
+type requestValue = any
 
 func (v requestValue) text() string {
 	if v == nil {
@@ -451,8 +451,8 @@ func (s *Server) testNode(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (s *Server) testNodes(w http.ResponseWriter, r *http.Request, body map[string]requestValue) {
-	values, ok := body["ids"].strings()
-	if !ok || len(values) > 20 {
+	values := body["ids"].strings()
+	if len(values) > 20 {
 		respondError(w, errors.New("ids 必须是最多 20 个节点 ID 的数组"))
 		return
 	}

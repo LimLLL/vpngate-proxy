@@ -140,7 +140,7 @@ func (r *Runtime) CheckPublicEgress(ctx context.Context, session string) (ProxyH
 			all = append(all, fmt.Sprintf("%s returned an invalid egress", address))
 			continue
 		}
-		result := ProxyHealth{OK: true, IP: ip.String(), LatencyMS: time.Since(start).Milliseconds()}
+		result := ProxyHealth{OK: true, IP: ip.String(), LatencyMS: time.Since(started).Milliseconds()}
 		r.mu.Lock()
 		r.LastCheck, r.ProxyHealth = time.Now(), result
 		r.mu.Unlock()

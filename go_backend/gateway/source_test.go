@@ -28,6 +28,14 @@ data-ciphers AES-128-CBC
 -----BEGIN CERTIFICATE-----
 test-certificates-are-parsed-by-native-core-not-this-validator
 </ca>
+<cert>
+-----BEGIN CERTIFICATE-----
+syntax-only-certificate-fixture
+</cert>
+<key>
+-----BEGIN PRIVATE KEY-----
+syntax-only-key-fixture
+</key>
 `, extra)
 }
 
