@@ -44,7 +44,7 @@ func main() {
 }
 
 func tunnelResponse(w http.ResponseWriter, r *http.Request) {
-	if _, ok := r.Header.Get("Proxy-Authorization"); ok {
+	if r.Header.Get("Proxy-Authorization") != "" {
 		http.Error(w, "proxy credentials must not reach the target", http.StatusBadRequest)
 		return
 	}

@@ -17,7 +17,6 @@ func PrepareProfile(profile, device string) string {
 			}
 			continue
 		}
-		fields := strings.Fields(trimmed)
 		directive := strings.TrimLeft(lower, "-")
 		switch {
 		case strings.HasPrefix(lower, "<"):
