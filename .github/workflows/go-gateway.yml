@@ -16,7 +16,7 @@ on:
         default: false
         type: boolean
 env:
-  OPENVPN3_COMMIT: 0b27d9df493db8bc9dc459a2b1cb6b670377b2
+  OPENVPN3_COMMIT: 0b27d9df493db8bc9dc459a2b1cb6b67037742b2
 jobs:
   build:
     runs-on: ubuntu-24.04
