@@ -1,0 +1,49 @@
+name: Go native gateway
+concurrency:
+  group: native-gateway-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_id) }}
+  cancel-in-progress: true
+on:
+  push:
+    paths:
+      - "go_backend/**"
+      - ".github/workflows/go-gateway.yml"
+  workflow_dispatch: {}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: go_backend/go.sum
+      - name: Install native build dependencies
+        run: |
+          sudo install -d -m 700 /root/.config/pip
+          printf 'global:\nbreak-system-packages: true\n' | sudo tee /root/.config/pip/pip.conf > /dev/null
+          sudo -E sh -c 'retry() { for attempt in 1 2 3 4 5 6; do "$@" && return 0; sleep 15; done; return 1; }; retry apt-get update; retry env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential cmake pkg-config git libssl-dev liblz4-dev liblzo2-dev zlib1g-dev openvpn curl iproute2 iputils-ping'
+      - name: Build the pinned official OpenVPN 3 Core and C++ bridge
+        run: |
+          cmake -S go_backend -B "${RUNNER_TEMP}/go-bridge-build" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DOPENVPN_EXTERNAL_TRANSPORT=ON
+          cmake --build "${RUNNER_TEMP}/go-bridge-build" --parallel 2
+          find "${RUNNER_TEMP}/go-bridge-build" -maxdepth 1 -name 'libvpngate_bridge*' -print
+      - name: Build, vet and test the complete Go gateway
+        env:
+          CGO_ENABLED: "1"
+          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build
+          CGO_CFLAGS: -I${{ github.workspace }}/go_backend
+          LD_LIBRARY_PATH: ${{ runner.temp }}/go-bridge-build
+          GOFLAGS: -buildvcs=false
+        run: |
+          cd go_backend
+          go test -race -count=1 -timeout 120s ./...
+          go vet ./...
+          go build -o "${RUNNER_TEMP}/vpngate-proxy" ./cmd/vpngate-proxy
+          go run ./cmd/mirror --fixture "${GITHUB_WORKSPACE}/mirror/vpngate.csv" --output-dir "${RUNNER_TEMP}/go-mirror"
+          grep -q '"row_count":' "${RUNNER_TEMP}/go-mirror/vpngate.meta.json"
+          cmp "${GITHUB_WORKSPACE}/mirror/vpngate.csv" "${RUNNER_TEMP}/go-mirror/vpngate.csv"

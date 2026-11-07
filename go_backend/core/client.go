@@ -52,18 +52,24 @@ type Client struct {
 	handle *C.VPNHandle
 	id     C.uint32_t
 
-	// OnEvent receives events after the controller has read them. Set it before
-	// calling Connect; it must not block the caller's goroutine.
+	// OnEvent is called synchronously by only one session goroutine at a time.
+	// Set it before Connect; it must not block their controller goroutine.
 	OnEvent func(Event)
 
-	events chan Event
-	Logs   chan string
-	done   chan struct{}
+	events  chan Event
+	Logs    chan string
+	done    chan struct{}
+	failure chan struct{}
 
-	mu         sync.Mutex
-	started    bool
-	closed     bool
-	connectErr error
+	mu          sync.Mutex
+	started     bool
+	closing     bool
+	closed      bool
+	connectErr  error
+	failureErr  error
+	failureOnce sync.Once
+	stopOnce    sync.Once
+	stopErr     error
 }
 
 var registry sync.Map
@@ -77,8 +83,7 @@ func Platform() string {
 func vpngateGoEvent(id C.uint32_t, name, info *C.char, nativeError, fatal C.int) {
 	if owner, ok := registry.Load(uint32(id)); ok {
 		client := owner.(*Client)
-		// Events are ordered and never dropped. Input must be drained by the
-		// connection's controller; in particular, CONNECTED cannot be lost.
+		// Events are ordered and their receiver stays active after CONNECTED.
 		client.events <- Event{Name: C.GoString(name), Info: C.GoString(info),
 			Error: nativeError != 0, Fatal: fatal != 0}
 	}
@@ -112,7 +117,7 @@ func NewClient(profile, username, password string, connectTimeout int) (*Client,
 		return nil, errors.New("failed to initialize the OpenVPN 3 Core client")
 	}
 	c := &Client{handle: handle, id: id, events: make(chan Event, 64),
-		Logs: make(chan string, 256), done: make(chan struct{})}
+		Logs: make(chan string, 256), done: make(chan struct{}), failure: make(chan struct{})}
 	registry.Store(uint32(id), c)
 
 	profileC, userC, passwordC := C.CString(profile), C.CString(username), C.CString(password)
@@ -126,11 +131,12 @@ func NewClient(profile, username, password string, connectTimeout int) (*Client,
 	return c, nil
 }
 
-// Connect starts the native session and waits for CONNECTED. The session stays
-// active after return; Close must be called to release its native resources.
+// Connect starts a session and waits for its native CONNECTED event. Logging
+// remains available on C++'s own connection thread; supervisory events continue
+// on this controller's goroutine after this method returns.
 func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 	c.mu.Lock()
-	if c.started || c.closed {
+	if c.started || c.closing || c.closed {
 		c.mu.Unlock()
 		return ConnectionInfo{}, errors.New("client is already started or closed")
 	}
@@ -140,11 +146,7 @@ func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-		err := statusError(C.vpn_client_connect(c.handle))
-		c.mu.Lock()
-		c.connectErr = err
-		c.mu.Unlock()
-		close(c.done)
+		c.complete(statusError(C.vpn_client_connect(c.handle)))
 	}()
 
 	for {
@@ -157,7 +159,11 @@ func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 				return ConnectionInfo{}, fmt.Errorf("OpenVPN 3 %s: %s", event.Name, event.Info)
 			}
 			if event.Name == "CONNECTED" {
-				return c.ConnectionInfo()
+				info, err := c.ConnectionInfo()
+				if err == nil {
+					go c.supervise()
+				}
+				return info, err
 			}
 		case <-c.done:
 			c.mu.Lock()
@@ -173,11 +179,60 @@ func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 	}
 }
 
-// ConnectionInfo reads state after CONNECTED from the controller goroutine,
-// never reentering Core from its native event callback.
+func (c *Client) complete(err error) {
+	c.mu.Lock()
+	c.connectErr = err
+	if err != nil && !c.closing {
+		c.failureErr = fmt.Errorf("unexpected OpenVPN 3 exit: %w", err)
+	}
+	c.mu.Unlock()
+	c.failureOnce.Do(func() { close(c.failure) })
+	close(c.done)
+}
+
+func (c *Client) supervise() {
+	for {
+		select {
+		case event := <-c.events:
+			if c.OnEvent != nil {
+				c.OnEvent(event)
+			}
+			if event.Fatal {
+				c.mu.Lock()
+				if c.failureErr == nil && !c.closing {
+					c.failureErr = fmt.Errorf("OpenVPN 3 %s: %s", event.Name, event.Info)
+				}
+				c.mu.Unlock()
+				c.failureOnce.Do(func() { close(c.failure) })
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// Failure closes for both unexpected disconnects and planned native stop.
+func (c *Client) Failure() <-chan struct{} { return c.failure }
+
+// FailureError returns nil for a planned stop or normal native completion.
+func (c *Client) FailureError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failureErr
+}
+
+// ConnectionInfo reads after CONNECTED, never reentering from a native callback.
 func (c *Client) ConnectionInfo() (ConnectionInfo, error) {
 	var info ConnectionInfo
-	raw := C.vpn_client_connection_info_json(c.handle)
+	c.mu.Lock()
+	if c.closed || c.handle == nil {
+		c.mu.Unlock()
+		return info, errors.New("native connection is closed")
+	}
+	handle := c.handle
+	c.mu.Unlock()
+	raw := C.vpn_client_connection_info_json(handle)
 	if raw == nil {
 		return info, errors.New("connection info is unavailable for a null handle")
 	}
@@ -191,7 +246,8 @@ func (c *Client) ConnectionInfo() (ConnectionInfo, error) {
 	return info, nil
 }
 
-// Close stops the native session, waits for connect() to return, then frees it.
+// Close stops and deletes one client. Concurrent close callers share the stop
+// request and all wait for the native connect thread before freeing resources.
 func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
@@ -199,24 +255,18 @@ func (c *Client) Close(ctx context.Context) error {
 		return nil
 	}
 	started := c.started
+	c.closing = true
 	c.mu.Unlock()
 	if !started {
 		c.closeUnstarted()
 		return nil
 	}
-	select {
-	case <-c.done:
-		c.closeUnstarted()
-		return nil
-	default:
-	}
-	if err := statusError(C.vpn_client_stop(c.handle)); err != nil {
-		return err
+	c.stopOnce.Do(func() { c.stopErr = statusError(C.vpn_client_stop(c.handle)) })
+	if c.stopErr != nil {
+		return c.stopErr
 	}
 	select {
 	case <-c.done:
-		// The connection's error is reported by Connect. Done means the
-		// handle can be freed even when that connection attempt failed.
 		c.closeUnstarted()
 		return nil
 	case <-ctx.Done():
