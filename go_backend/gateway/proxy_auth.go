@@ -29,3 +29,7 @@ type readerConn struct {
 	io.Reader
 	net.Conn
 }
+
+func (c readerConn) Read(data []byte) (int, error) {
+	return c.Reader.Read(data)
+}

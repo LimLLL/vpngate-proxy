@@ -148,7 +148,7 @@ func (p *Proxy) lease(ctx context.Context, username, password string) (*Lease, e
 	if !p.validCredentials(username, password) {
 		return nil, errors.New("proxy authentication failed or session is invalid")
 	}
-	spec, _ := ParseSession(username)
+	spec, err := ParseSession(username)
 	if err != nil {
 		return nil, err
 	}

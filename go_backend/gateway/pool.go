@@ -57,6 +57,7 @@ type Pool struct {
 	sessions       map[string]*sessionEntry
 	spare          []Endpoint
 	assigned       map[Endpoint]struct{}
+	owned          map[Endpoint]struct{}
 	endpointLeases map[Endpoint]int
 	pending        int
 	wake           chan struct{}
@@ -100,7 +101,8 @@ func NewPool(parent context.Context, config PoolConfig) (*Pool, error) {
 	ctx, cancel := context.WithCancel(parent)
 	p := &Pool{config: config, sessions: make(map[string]*sessionEntry),
 		assigned: make(map[Endpoint]struct{}), endpointLeases: make(map[Endpoint]int),
-		wake: make(chan struct{}), cancel: cancel, workerCtx: ctx}
+		owned: make(map[Endpoint]struct{}),
+		wake:  make(chan struct{}), cancel: cancel, workerCtx: ctx}
 	p.lifecycle.Add(1)
 	go func() {
 		defer p.lifecycle.Done()
@@ -131,11 +133,12 @@ func (p *Pool) build() (Endpoint, error) {
 	}
 	go p.monitor(endpoint)
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || terminal(endpoint) {
 		p.mu.Unlock()
 		p.close(endpoint)
-		return nil, errors.New("pool closed during setup")
+		return nil, errors.New("tunnel failed or pool closed during setup")
 	}
+	p.owned[endpoint] = struct{}{}
 	p.spare = append(p.spare, endpoint)
 	p.pending--
 	p.signal()
@@ -410,9 +413,13 @@ func (p *Pool) reclaimer(ctx context.Context) {
 func (p *Pool) close(endpoint Endpoint) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := endpoint.Close(ctx); err != nil {
+	err := endpoint.Close(ctx)
+	if err != nil {
 		p.config.Logf("close %s: %v", endpoint.Device(), err)
 	}
+	p.mu.Lock()
+	delete(p.owned, endpoint)
+	p.mu.Unlock()
 }
 
 func (p *Pool) Close() error {
@@ -423,8 +430,8 @@ func (p *Pool) Close() error {
 	}
 	p.closed = true
 	p.cancel()
-	endpoints := append([]Endpoint(nil), p.spare...)
-	for endpoint := range p.assigned {
+	endpoints := make([]Endpoint, 0, len(p.owned))
+	for endpoint := range p.owned {
 		endpoints = append(endpoints, endpoint)
 	}
 	p.spare = nil
@@ -440,11 +447,19 @@ func (p *Pool) Close() error {
 	}
 	p.workers.Wait()
 	p.lifecycle.Wait()
+	p.mu.Lock()
+	for endpoint := range p.owned {
+		endpoints = append(endpoints, endpoint)
+	}
+	p.mu.Unlock()
+	for _, endpoint := range endpoints {
+		p.close(endpoint)
+	}
 	return nil
 }
 
 // Status returns session count, spare identities and current ticket bindings.
-func (p *Pool) Status() (int, []SessionStatus, []SessionStatus) {
+func (p *Pool) Status() (active int, spare []SessionStatus, connected []SessionStatus) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	connected = make([]SessionStatus, 0, len(p.sessions))
@@ -464,7 +479,8 @@ func (p *Pool) Status() (int, []SessionStatus, []SessionStatus) {
 			spare = append(spare, SessionStatus{Device: endpoint.Device()})
 		}
 	}
-	return len(p.sessions), spare, connected
+	active = len(p.sessions)
+	return active, spare, connected
 }
 
 // Invalidate closes unused prewarmed tunnels so a new routing policy cannot
@@ -477,10 +493,10 @@ func (p *Pool) Invalidate() {
 	spare := append([]Endpoint(nil), p.spare...)
 	p.spare = nil
 	p.signal()
+	p.mu.Unlock()
 	for _, endpoint := range spare {
 		p.close(endpoint)
 	}
-	p.mu.Unlock()
 }
 
 func (p *Pool) Pending() int {
