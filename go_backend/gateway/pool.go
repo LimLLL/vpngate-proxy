@@ -40,8 +40,8 @@ var (
 	errPoolClosed      = errors.New("pool closed")
 )
 
-// sessionRetention keeps an expired session's last node so the next request
-// with that ID still rotates away from it.
+// sessionRetention keeps an expired session's last node and egress so the next
+// request with that ID still rotates away from them.
 const sessionRetention = 30 * time.Minute
 
 type PoolConfig struct {
@@ -55,13 +55,19 @@ type PoolConfig struct {
 	IdleTimeout     time.Duration
 	ConnectTimeout  time.Duration
 	ConnectAttempts int
-	Logf            func(string, ...any)
+	// Egress reports the public IP seen through a new tunnel. Different nodes
+	// can share one NAT egress, so sessions are spread and rotated by this IP
+	// rather than by node. Nil, or a failed probe, leaves the egress unknown
+	// and each such tunnel counts as its own IP.
+	Egress func(ctx context.Context, device string) (string, error)
+	Logf   func(string, ...any)
 }
 
 // tunnel is shared by every session and connection routed to its node, since
 // a second tunnel to the same node would not give a different egress IP.
 type tunnel struct {
 	node     nodes.Candidate
+	egress   string // public IP behind the node; empty when unknown
 	device   string
 	slot     int
 	endpoint Endpoint
@@ -74,7 +80,7 @@ type tunnel struct {
 type session struct {
 	request   Request
 	tunnel    *tunnel // nil once expired or after the tunnel died
-	node      string  // last assigned node, excluded when rotating
+	last      avoid   // last assigned node and egress, avoided when rotating
 	expires   time.Time
 	assigning chan struct{}
 }
@@ -105,6 +111,7 @@ type Lease struct {
 	Device  string
 	NodeID  string
 	Country string
+	Egress  string // empty when unknown
 
 	pool   *Pool
 	tunnel *tunnel
@@ -176,58 +183,64 @@ func (p *Pool) Acquire(ctx context.Context, request Request) (*Lease, error) {
 				return p.lease(request, t), nil
 			}
 		}
-		exclude := ""
 		if s == nil {
 			s = &session{}
 			p.sessions[request.Session] = s
 		} else {
-			exclude = s.node
 			p.unbind(s)
 		}
+		previous := s.last
 		s.request = request
 		wait := make(chan struct{})
 		s.assigning = wait
 		p.mu.Unlock()
 
-		t, err := p.choose(ctx, request.Country, exclude, true)
+		t, err := p.choose(ctx, request.Country, previous, true)
 
 		p.mu.Lock()
 		s.assigning = nil
 		close(wait)
 		if err != nil {
-			if s.node == "" {
+			if s.last.node == "" {
 				delete(p.sessions, request.Session)
 			}
 			p.mu.Unlock()
 			return nil, err
 		}
-		s.tunnel, s.node = t, t.node.ID
+		s.tunnel, s.last = t, avoid{node: t.node.ID, egress: t.egress}
 		s.expires = time.Now().Add(request.TTL)
 		p.mu.Unlock()
 		return p.lease(request, t), nil
 	}
 }
 
+// avoid names the node and egress a rotating session must move away from.
+type avoid struct{ node, egress string }
+
+func (a avoid) blocks(t *tunnel) bool {
+	return t.node.ID == a.node || a.egress != "" && t.egress == a.egress
+}
+
 // choose returns a tunnel with a lease, and for sticky requests the session,
 // already counted under the same lock that picked it, so concurrent new
-// sessions cannot both claim the same free tunnel. Sticky sessions prefer a
-// tunnel no other session uses, then a new node, and share only as a last
-// resort; rotating connections take live tunnels in turn. While other opens
-// are in flight it waits for them rather than failing, which matters for the
+// sessions cannot both claim the same free IP. Sticky sessions prefer an
+// egress no other session uses, then a new node, and share only as a last
+// resort; rotating connections take egress IPs in turn. While other opens are
+// in flight it waits for them rather than failing, which matters for the
 // burst of requests right after startup.
-func (p *Pool) choose(ctx context.Context, country, exclude string, sticky bool) (*tunnel, error) {
+func (p *Pool) choose(ctx context.Context, country string, away avoid, sticky bool) (*tunnel, error) {
 	for {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
 			return nil, errPoolClosed
 		}
-		if t := p.pickLive(country, exclude, sticky, false); t != nil {
+		if t := p.pickLive(country, away, sticky, false); t != nil {
 			p.mu.Unlock()
 			return t, nil
 		}
 		p.mu.Unlock()
-		t, openErr := p.open(ctx, country, exclude, sticky)
+		t, openErr := p.open(ctx, country, away, sticky)
 		if t != nil {
 			return t, nil
 		}
@@ -236,15 +249,16 @@ func (p *Pool) choose(ctx context.Context, country, exclude string, sticky bool)
 			p.mu.Unlock()
 			return nil, errPoolClosed
 		}
-		if t := p.pickLive(country, exclude, sticky, true); t != nil {
+		if t := p.pickLive(country, away, sticky, true); t != nil {
 			p.mu.Unlock()
 			return t, nil
 		}
-		if t := p.tunnels[exclude]; exclude != "" && t != nil && matches(t, country) {
-			p.config.Logf("no other node for country %q; session stays on %s", country, exclude)
-			p.take(t, sticky)
-			p.mu.Unlock()
-			return t, nil
+		if away != (avoid{}) {
+			if t := p.pickLive(country, avoid{}, sticky, true); t != nil {
+				p.config.Logf("no other IP for country %q; session stays on %s", country, t.egress)
+				p.mu.Unlock()
+				return t, nil
+			}
 		}
 		if len(p.opening) == 0 {
 			p.mu.Unlock()
@@ -267,10 +281,11 @@ func (p *Pool) notify() {
 }
 
 // pickLive must be called with p.mu held; it takes the result like choose.
-func (p *Pool) pickLive(country, exclude string, sticky, share bool) *tunnel {
+// Without share, a sticky request only accepts an egress no session uses.
+func (p *Pool) pickLive(country string, away avoid, sticky, share bool) *tunnel {
 	var live []*tunnel
-	for id, t := range p.tunnels {
-		if id != exclude && matches(t, country) && (!sticky || share || t.sessions == 0) {
+	for _, t := range p.tunnels {
+		if matches(t, country) && !away.blocks(t) && (!sticky || share || p.egressLoad(t) == 0) {
 			live = append(live, t)
 		}
 	}
@@ -279,21 +294,55 @@ func (p *Pool) pickLive(country, exclude string, sticky, share bool) *tunnel {
 	}
 	sort.Slice(live, func(i, j int) bool {
 		a, b := live[i], live[j]
-		if sticky && a.sessions != b.sessions {
-			return a.sessions < b.sessions
+		if loadA, loadB := p.egressLoad(a), p.egressLoad(b); sticky && loadA != loadB {
+			return loadA < loadB
 		}
-		if sticky && a.leases != b.leases {
+		if a.leases != b.leases {
 			return a.leases < b.leases
 		}
 		return a.node.ID < b.node.ID
 	})
 	t := live[0]
 	if !sticky {
-		t = live[p.next%len(live)]
+		// Rotate over distinct egress IPs, taking the least busy tunnel of
+		// each, so consecutive requests change IP even behind shared NAT.
+		var groups []*tunnel
+		seen := make(map[string]bool)
+		for _, candidate := range live {
+			key := egressKey(candidate)
+			if !seen[key] {
+				seen[key] = true
+				groups = append(groups, candidate)
+			}
+		}
+		sort.Slice(groups, func(i, j int) bool { return egressKey(groups[i]) < egressKey(groups[j]) })
+		t = groups[p.next%len(groups)]
 		p.next++
 	}
 	p.take(t, sticky)
 	return t
+}
+
+// egressLoad counts sticky sessions on every live tunnel sharing t's egress.
+func (p *Pool) egressLoad(t *tunnel) int {
+	if t.egress == "" {
+		return t.sessions
+	}
+	load := 0
+	for _, other := range p.tunnels {
+		if other.egress == t.egress {
+			load += other.sessions
+		}
+	}
+	return load
+}
+
+// egressKey groups tunnels by IP; an unknown egress is its own group.
+func egressKey(t *tunnel) string {
+	if t.egress == "" {
+		return "node:" + t.node.ID
+	}
+	return t.egress
 }
 
 func (p *Pool) take(t *tunnel, sticky bool) {
@@ -317,7 +366,7 @@ func (p *Pool) unbind(s *session) {
 
 func (p *Pool) lease(request Request, t *tunnel) *Lease {
 	return &Lease{Request: request, Device: t.device, NodeID: t.node.ID,
-		Country: t.node.Country, pool: p, tunnel: t}
+		Country: t.node.Country, Egress: t.egress, pool: p, tunnel: t}
 }
 
 func (l *Lease) Release() {
@@ -331,6 +380,7 @@ func (l *Lease) Release() {
 
 type TunnelStatus struct {
 	Node     string
+	Egress   string
 	Country  string
 	Device   string
 	Sessions int
@@ -354,11 +404,11 @@ func (p *Pool) Status() PoolStatus {
 	defer p.mu.Unlock()
 	var status PoolStatus
 	for _, t := range p.tunnels {
-		status.Tunnels = append(status.Tunnels, TunnelStatus{Node: t.node.ID, Country: t.node.Country,
+		status.Tunnels = append(status.Tunnels, TunnelStatus{Node: t.node.ID, Egress: t.egress, Country: t.node.Country,
 			Device: t.device, Sessions: t.sessions, Leases: t.leases})
 	}
 	for id, s := range p.sessions {
-		entry := SessionStatus{ID: id, Node: s.node, Expires: s.expires}
+		entry := SessionStatus{ID: id, Node: s.last.node, Expires: s.expires}
 		if s.tunnel != nil && !s.tunnel.retired {
 			entry.Device = s.tunnel.device
 		}

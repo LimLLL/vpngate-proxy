@@ -57,7 +57,7 @@ func ConnectNative(ctx context.Context, node nodes.Candidate, device string, slo
 		closeClient(client)
 		return nil, fmt.Errorf("expected %s, Core opened %q", device, info.TUNName)
 	}
-	cleanup, err := installRoute(device, slot)
+	cleanup, err := InstallRoute(device, slot)
 	if err != nil {
 		closeClient(client)
 		return nil, err
@@ -89,10 +89,10 @@ func closeClient(client *core.Client) {
 	}
 }
 
-// installRoute sends traffic leaving device through it via a per-slot table.
+// InstallRoute sends traffic leaving device through it via a per-slot table.
 // The profile's route-nopull keeps the main table, and with it the OpenVPN
 // transport socket, on the physical uplink.
-func installRoute(device string, slot int) (func() error, error) {
+func InstallRoute(device string, slot int) (func() error, error) {
 	if slot < 0 || slot > 10000 {
 		return nil, fmt.Errorf("tunnel slot %d is outside the supported range", slot)
 	}

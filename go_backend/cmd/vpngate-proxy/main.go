@@ -74,6 +74,9 @@ func run(dataDir string, printOnly bool) error {
 		IdleTimeout:     10 * time.Minute,
 		ConnectTimeout:  connectTimeout,
 		ConnectAttempts: 3,
+		Egress: func(ctx context.Context, device string) (string, error) {
+			return gateway.ProbeEgress(ctx, device, "https://api.ipify.org")
+		},
 	})
 	if err != nil {
 		return err

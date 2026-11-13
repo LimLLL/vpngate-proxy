@@ -1,3 +1,6 @@
+// Command bench compares tunnel engines on a controlled OpenVPN server: it
+// opens N tunnels at once, sends real traffic through each, samples the
+// engine's resources, then stops every tunnel. CI only (root, TUN).
 package main
 
 import (
@@ -6,324 +9,258 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/LimLLL/vpngate-proxy/go_backend/core"
+	"github.com/LimLLL/vpngate-proxy/go_backend/gateway"
+	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
-type options struct {
-	profiles        []string
-	connectDeadline time.Duration
-	stopTimeout     time.Duration
-	stopDeadline    time.Duration
-}
-
 type sessionReport struct {
-	Device      string              `json:"device"`
-	ConfigureMs float64             `json:"configure_ms"`
-	ConnectMs   float64             `json:"connect_ms"`
-	CloseMs     float64             `json:"close_ms"`
-	Info        core.ConnectionInfo `json:"info"`
-	Error       string              `json:"error,omitempty"`
+	Device    string  `json:"device"`
+	ConnectMs float64 `json:"connect_ms"`
+	TrafficMs float64 `json:"traffic_ms"`
+	StopMs    float64 `json:"stop_ms"`
+	Error     string  `json:"error,omitempty"`
 }
 
-type runReport struct {
-	Backend                 string          `json:"backend"`
-	CoreVersion             string          `json:"core_version"`
-	Concurrency             int             `json:"concurrency"`
-	Stage                   string          `json:"stage"`
-	Sessions                []sessionReport `json:"sessions"`
-	MaxReadyMs              float64         `json:"max_ready_ms"`
-	WallReadyMs             float64         `json:"wall_ready_ms"`
-	EngineProcessCount      int             `json:"engine_process_count"`
-	ThreadsAfterConnect     int             `json:"threads_after_connect"`
-	CurrentRSSKBAfterActive int             `json:"current_rss_kb_after_connect"`
-	PeakRSSKB               int             `json:"peak_rss_kb"`
-	CPUMs                   float64         `json:"cpu_ms"`
-	Errors                  []string        `json:"errors,omitempty"`
-}
-
-type sessionResult struct {
-	index     int
-	connectMs float64
-	info      core.ConnectionInfo
-	err       error
-}
-
-type resources struct {
-	threads int
-	rssKB   int
-	peakKB  int
-}
-
-func elapsedMs(start time.Time) float64 {
-	return float64(time.Since(start)) / float64(time.Millisecond)
-}
-
-func cpuMilliseconds() (float64, error) {
-	var usage syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
-		return 0, err
-	}
-	seconds := float64(usage.Utime.Sec+usage.Stime.Sec) + float64(usage.Utime.Usec+usage.Stime.Usec)/1e6
-	return seconds * 1000, nil
-}
-
-func statusValue(text, key string) (int, error) {
-	for _, line := range strings.Split(text, "\n") {
-		if strings.HasPrefix(line, key+":") {
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				return 0, fmt.Errorf("unexpected %s value %q", key, line)
-			}
-			return strconv.Atoi(fields[1])
-		}
-	}
-	return 0, fmt.Errorf("%s is absent from /proc/self/status", key)
-}
-
-func processResources() (resources, error) {
-	raw, err := os.ReadFile("/proc/self/status")
-	if err != nil {
-		return resources{}, err
-	}
-	var result resources
-	values := []struct {
-		name   string
-		target *int
-	}{{"Threads", &result.threads}, {"VmRSS", &result.rssKB}, {"VmHWM", &result.peakKB}}
-	for _, value := range values {
-		parsed, err := statusValue(string(raw), value.name)
-		if err != nil {
-			return resources{}, err
-		}
-		*value.target = parsed
-	}
-	return result, nil
-}
-
-func writeReport(path string, report runReport) error {
-	data, err := json.MarshalIndent(report, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o600)
-}
-
-func closeAll(clients []*core.Client, report *runReport, stopTimeout time.Duration) error {
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var stopErrors []error
-	for index, client := range clients {
-		if client == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(index int, client *core.Client) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
-			defer cancel()
-			started := time.Now()
-			err := client.Close(ctx)
-			mu.Lock()
-			report.Sessions[index].CloseMs = elapsedMs(started)
-			mu.Unlock()
-			if err != nil {
-				mu.Lock()
-				report.Sessions[index].Error = err.Error()
-				stopErrors = append(stopErrors, fmt.Errorf("%s: %w", report.Sessions[index].Device, err))
-				mu.Unlock()
-			}
-		}(index, client)
-	}
-	wg.Wait()
-	return errors.Join(stopErrors...)
-}
-
-// connectAll prepares every profile before starting the concurrent handshakes.
-func connectAll(opts options, clients []*core.Client, report *runReport) error {
-	for index, path := range opts.profiles {
-		profile, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", path, err)
-		}
-		device := fmt.Sprintf("tun%d", index)
-		report.Sessions[index].Device = device
-		started := time.Now()
-		client, err := core.NewClient(string(profile), "vpn", "vpn", 15)
-		report.Sessions[index].ConfigureMs = elapsedMs(started)
-		if err != nil {
-			return fmt.Errorf("configure %s: %w", device, err)
-		}
-		clients[index] = client
-		client.OnEvent = func(event core.Event) {
-			if event.Error || event.Fatal {
-				fmt.Printf("%s event: %+v\n", device, event)
-			}
-		}
-	}
-
-	responses := make(chan sessionResult, len(clients))
-	for index, client := range clients {
-		go func(index int, client *core.Client) {
-			ctx, cancel := context.WithTimeout(context.Background(), opts.connectDeadline)
-			defer cancel()
-			started := time.Now()
-			info, err := client.Connect(ctx)
-			responses <- sessionResult{index: index, connectMs: elapsedMs(started), info: info, err: err}
-		}(index, client)
-	}
-
-	var connectErrors []error
-	for range clients {
-		result := <-responses
-		report.Sessions[result.index].ConnectMs = result.connectMs
-		if result.err != nil {
-			report.Sessions[result.index].Error = result.err.Error()
-			connectErrors = append(connectErrors, result.err)
-			continue
-		}
-		expected := fmt.Sprintf("tun%d", result.index)
-		if result.info.TUNName != expected {
-			err := fmt.Errorf("expected %s, got %s", expected, result.info.TUNName)
-			report.Sessions[result.index].Error = err.Error()
-			connectErrors = append(connectErrors, err)
-			continue
-		}
-		report.Sessions[result.index].Info = result.info
-	}
-	return errors.Join(connectErrors...)
-}
-
-func waitForStop(path string, deadline time.Duration) error {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	timeout := time.NewTimer(deadline)
-	defer timeout.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			_, err := os.Stat(path)
-			if err == nil {
-				return nil
-			}
-			if !os.IsNotExist(err) {
-				return fmt.Errorf("check stop file: %w", err)
-			}
-		case <-timeout.C:
-			return fmt.Errorf("external traffic check did not finish within %s", deadline)
-		}
-	}
+// report covers only the engine: for core that is this whole process, so the
+// Go controller is included and BaselineRSSKB shows its share before any
+// tunnel; for cli it is the sum over the openvpn child processes.
+type report struct {
+	Engine          string          `json:"engine"`
+	Version         string          `json:"version"`
+	Tunnels         int             `json:"tunnels"`
+	Connected       int             `json:"connected"`
+	TrafficOK       int             `json:"traffic_ok"`
+	Stopped         int             `json:"stopped"`
+	WallReadyMs     float64         `json:"wall_ready_ms"`
+	MedianConnectMs float64         `json:"median_connect_ms"`
+	MaxConnectMs    float64         `json:"max_connect_ms"`
+	MaxStopMs       float64         `json:"max_stop_ms"`
+	Processes       int             `json:"processes"`
+	Threads         int             `json:"threads"`
+	RSSKB           int             `json:"rss_kb"`
+	PeakRSSKB       int             `json:"peak_rss_kb"`
+	BaselineRSSKB   int             `json:"baseline_rss_kb"`
+	CPUMs           float64         `json:"cpu_ms"`
+	Sessions        []sessionReport `json:"sessions"`
+	Errors          []string        `json:"errors,omitempty"`
 }
 
 func main() {
-	profileList := flag.String("profiles", "", "comma-separated prepared profile paths")
-	readyFile := flag.String("ready-file", "", "file created after every tunnel is ready")
-	stopFile := flag.String("stop-file", "", "file requesting benchmark shutdown")
-	reportFile := flag.String("report", "", "path for the benchmark JSON report")
-	stopDeadline := flag.Duration("stop-deadline", 60*time.Second, "maximum wait for the external traffic check")
-	connectDeadline := flag.Duration("connect-deadline", 60*time.Second, "per-tunnel connection timeout")
-	stopTimeout := flag.Duration("stop-timeout", 10*time.Second, "per-tunnel stop timeout")
+	engineName := flag.String("engine", "core", "core (embedded OpenVPN 3 Core) or cli (one openvpn process per tunnel)")
+	pattern := flag.String("profiles", "", "glob of client profiles, one tunnel each (at most 128)")
+	target := flag.String("target", "", "URL fetched through every tunnel; must answer vpn-client=<VPN address>")
+	reportPath := flag.String("report", "", "JSON report path")
+	connectTimeout := flag.Duration("connect-timeout", 60*time.Second, "per-tunnel connect timeout")
+	stopTimeout := flag.Duration("stop-timeout", 15*time.Second, "per-tunnel stop timeout")
 	flag.Parse()
-	paths := strings.Split(*profileList, ",")
-	if *profileList == "" || len(paths) < 1 || len(paths) > 128 || *readyFile == "" || *stopFile == "" || *reportFile == "" {
+	if *pattern == "" || *target == "" || *reportPath == "" {
 		flag.Usage()
-		log.Fatal("one to 128 profiles and ready, stop and report paths are required")
+		os.Exit(2)
 	}
-	if *connectDeadline <= 0 || *stopTimeout <= 0 {
-		log.Fatal("connect and stop timeouts must be positive")
+	var selected engine
+	switch *engineName {
+	case "core":
+		selected = coreEngine{timeout: *connectTimeout}
+	case "cli":
+		selected = cliEngine{timeout: *connectTimeout, workDir: os.TempDir()}
+	default:
+		log.Fatalf("unknown engine %q", *engineName)
 	}
-	opts := options{
-		profiles: paths, stopDeadline: *stopDeadline,
-		connectDeadline: *connectDeadline, stopTimeout: *stopTimeout,
+	result, runErr := run(selected, *pattern, *target, *connectTimeout, *stopTimeout)
+	if runErr != nil {
+		result.Errors = append(result.Errors, runErr.Error())
 	}
+	encoded, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := os.WriteFile(*reportPath, append(encoded, '\n'), 0o644); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s x%d: connected %d, traffic %d, stopped %d, ready %.0f ms, rss %d KiB, errors %d\n",
+		result.Engine, result.Tunnels, result.Connected, result.TrafficOK, result.Stopped,
+		result.WallReadyMs, result.RSSKB, len(result.Errors))
+	if len(result.Errors) > 0 {
+		os.Exit(1)
+	}
+}
 
+func run(selected engine, pattern, target string, connectTimeout, stopTimeout time.Duration) (report, error) {
+	result := report{Engine: selected.Name(), Version: selected.Version()}
+	profiles, err := nodes.LoadProfiles(pattern)
+	if err != nil {
+		return result, err
+	}
+	if len(profiles) > 128 {
+		return result, fmt.Errorf("%d profiles exceed the 128-tunnel limit", len(profiles))
+	}
+	result.Tunnels = len(profiles)
+	result.Sessions = make([]sessionReport, len(profiles))
+	baseline, err := readProc("self")
+	if err != nil {
+		return result, err
+	}
+	result.BaselineRSSKB = baseline.rssKB
+
+	tunnels := make([]tunnel, len(profiles))
 	started := time.Now()
-	cpuStart, err := cpuMilliseconds()
-	if err != nil {
-		log.Fatal(err)
-	}
-	report := runReport{
-		Backend: "go-openvpn3-core", CoreVersion: core.Platform(), Concurrency: len(paths),
-		Stage: "starting", Sessions: make([]sessionReport, len(paths)), EngineProcessCount: 1,
-	}
-	clients := make([]*core.Client, len(paths))
-	var resultErr error
-	if err := connectAll(opts, clients, &report); err != nil {
-		resultErr = err
-		report.Stage = "connect_failed"
-	} else {
-		report.MaxReadyMs = 0
-		for _, session := range report.Sessions {
-			report.MaxReadyMs = max(report.MaxReadyMs, session.ConnectMs)
-		}
-		report.WallReadyMs = elapsedMs(started)
-		resources, err := processResources()
+	parallel(len(profiles), func(i int) {
+		session := &result.Sessions[i]
+		session.Device = fmt.Sprintf("tun%d", i)
+		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+		defer cancel()
+		begin := time.Now()
+		t, err := selected.Connect(ctx, profiles[i].Profile, session.Device)
+		session.ConnectMs = milliseconds(begin)
 		if err != nil {
-			resultErr = err
-			report.Stage = "metrics_failed"
-		} else {
-			report.ThreadsAfterConnect = resources.threads
-			report.CurrentRSSKBAfterActive = resources.rssKB
-			report.PeakRSSKB = resources.peakKB
-			report.Stage = "connected"
-			if err := writeReport(*reportFile, report); err != nil {
-				resultErr = err
-			} else if err := os.WriteFile(*readyFile, []byte("ready\n"), 0o600); err != nil {
-				resultErr = fmt.Errorf("write ready file: %w", err)
-			} else {
-				resultErr = waitForStop(*stopFile, *stopDeadline)
-				if resultErr != nil {
-					report.Stage = "external_check_failed"
-				}
-			}
+			session.Error = "connect: " + err.Error()
+			return
 		}
+		tunnels[i] = t
+	})
+	result.WallReadyMs = milliseconds(started)
+
+	var routeCleanups []func() error
+	for i, t := range tunnels {
+		if t == nil {
+			continue
+		}
+		result.Connected++
+		cleanup, err := gateway.InstallRoute(result.Sessions[i].Device, i)
+		if err != nil {
+			result.Sessions[i].Error = "route: " + err.Error()
+			continue
+		}
+		routeCleanups = append(routeCleanups, cleanup)
+	}
+	parallel(len(tunnels), func(i int) {
+		session := &result.Sessions[i]
+		if tunnels[i] == nil || session.Error != "" {
+			return
+		}
+		begin := time.Now()
+		if err := fetchThrough(session.Device, target); err != nil {
+			session.Error = "traffic: " + err.Error()
+			return
+		}
+		session.TrafficMs = milliseconds(begin)
+	})
+	for i, session := range result.Sessions {
+		if tunnels[i] != nil && session.Error == "" {
+			result.TrafficOK++
+		}
+	}
+	if err := sampleEngine(&result, tunnels); err != nil {
+		result.Errors = append(result.Errors, "sample: "+err.Error())
 	}
 
-	// Sample before SIGTERM/native stop in both backends. Process-wide CPU
-	// includes the Go controller, Core and handshake/data-plane activity; the
-	// CLI reports the equivalent cumulative CPU of its OpenVPN child PIDs.
-	cpuEnd, err := cpuMilliseconds()
-	if err != nil {
-		resultErr = errors.Join(resultErr, err)
-	} else {
-		report.CPUMs = cpuEnd - cpuStart
-	}
-	if err := closeAll(clients, &report, opts.stopTimeout); err != nil {
-		resultErr = errors.Join(resultErr, err)
-		report.Stage = "stop_failed"
-	} else if resultErr == nil {
-		report.Stage = "stopped"
-	}
-	if finalResources, err := processResources(); err != nil {
-		resultErr = errors.Join(resultErr, err)
-	} else {
-		report.PeakRSSKB = max(report.PeakRSSKB, finalResources.peakKB)
-	}
-	report.Errors = report.Errors[:0]
-	for _, session := range report.Sessions {
-		if session.Error != "" {
-			report.Errors = append(report.Errors, session.Device+": "+session.Error)
+	parallel(len(tunnels), func(i int) {
+		if tunnels[i] == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
+		defer cancel()
+		begin := time.Now()
+		err := tunnels[i].Close(ctx)
+		result.Sessions[i].StopMs = milliseconds(begin)
+		if err != nil {
+			result.Sessions[i].Error = strings.TrimPrefix(result.Sessions[i].Error+"; stop: "+err.Error(), "; ")
+		}
+	})
+	var connects []float64
+	for i, session := range result.Sessions {
+		if tunnels[i] == nil {
+			continue
+		}
+		connects = append(connects, session.ConnectMs)
+		result.MaxConnectMs = max(result.MaxConnectMs, session.ConnectMs)
+		result.MaxStopMs = max(result.MaxStopMs, session.StopMs)
+		if !strings.Contains(session.Error, "stop: ") {
+			result.Stopped++
 		}
 	}
-	if resultErr != nil {
-		report.Errors = append(report.Errors, resultErr.Error())
+	if len(connects) > 0 {
+		sort.Float64s(connects)
+		result.MedianConnectMs = connects[len(connects)/2]
 	}
-	if err := writeReport(*reportFile, report); err != nil {
-		resultErr = errors.Join(resultErr, fmt.Errorf("write benchmark report: %w", err))
+	var cleanupErrs []error
+	for _, cleanup := range routeCleanups {
+		cleanupErrs = append(cleanupErrs, cleanup())
 	}
-	encoded, err := json.MarshalIndent(report, "", "  ")
+	for _, session := range result.Sessions {
+		if session.Error != "" {
+			result.Errors = append(result.Errors, session.Device+": "+session.Error)
+		}
+	}
+	return result, errors.Join(cleanupErrs...)
+}
+
+// sampleEngine records resources while every tunnel is still up and after
+// traffic, so CPU covers handshakes plus the data path for both engines.
+func sampleEngine(result *report, tunnels []tunnel) error {
+	var pids []string
+	for _, t := range tunnels {
+		if t != nil && t.PID() != 0 {
+			pids = append(pids, fmt.Sprint(t.PID()))
+		}
+	}
+	if result.Engine == "core" {
+		pids = []string{"self"}
+	}
+	result.Processes = len(pids)
+	for _, pid := range pids {
+		stats, err := readProc(pid)
+		if err != nil {
+			return err
+		}
+		result.Threads += stats.threads
+		result.RSSKB += stats.rssKB
+		result.PeakRSSKB += stats.peakKB
+		result.CPUMs += stats.cpuMs
+	}
+	return nil
+}
+
+// fetchThrough sends one HTTP request from a socket bound to device and
+// checks the server saw a VPN client address, proving the tunnel carried it.
+func fetchThrough(device, target string) error {
+	client := &http.Client{Transport: gateway.DeviceTransport(device), Timeout: 20 * time.Second}
+	response, err := client.Get(target)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	fmt.Println(string(encoded))
-	if resultErr != nil {
-		log.Fatal(resultErr)
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 256))
+	if err != nil {
+		return err
 	}
+	if response.StatusCode != http.StatusOK || !strings.HasPrefix(string(body), "vpn-client=") {
+		return fmt.Errorf("unexpected answer %d %q", response.StatusCode, body)
+	}
+	return nil
+}
+
+func parallel(count int, work func(int)) {
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			work(i)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func milliseconds(since time.Time) float64 {
+	return float64(time.Since(since).Microseconds()) / 1000
 }

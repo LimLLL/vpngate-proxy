@@ -1,0 +1,39 @@
+name: Native OpenVPN 3 Core bridge
+description: >-
+  Installs the native dependencies and builds libvpngate_bridge from a pinned
+  OpenVPN 3 Core commit into $RUNNER_TEMP/go-bridge-build. The build is cached
+  by Core commit and bridge sources.
+inputs:
+  core-commit:
+    description: Pinned OpenVPN 3 Core commit
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install the native build and test dependencies
+      shell: bash
+      run: |
+        sudo -E sh -c 'retry() { for attempt in 1 2 3 4 5 6; do "$@" && return 0; sleep 15; done; return 1; }; retry apt-get update; retry env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates cmake curl g++ git iproute2 jq ninja-build openvpn pkg-config libasio-dev libcap-dev libfmt-dev liblz4-dev libjsoncpp-dev libssl-dev libxxhash-dev iputils-ping'
+    - name: Restore the bridge build
+      id: cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/go-bridge-build/libvpngate_bridge.so
+        key: bridge-${{ runner.os }}-${{ inputs.core-commit }}-${{ hashFiles('go_backend/bridge.cpp', 'go_backend/bridge.h', 'go_backend/CMakeLists.txt') }}
+    - name: Fetch the pinned OpenVPN 3 Core
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CORE_COMMIT: ${{ inputs.core-commit }}
+      run: |
+        source_dir="${RUNNER_TEMP}/openvpn3-core"
+        git init -q "${source_dir}"
+        git -C "${source_dir}" fetch -q --depth 1 https://github.com/OpenVPN/openvpn3.git "${CORE_COMMIT}"
+        git -C "${source_dir}" checkout -q --detach FETCH_HEAD
+        test "$(git -C "${source_dir}" rev-parse HEAD)" = "${CORE_COMMIT}"
+    - name: Build the C ABI bridge with the official Core
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cmake -S go_backend -B "${RUNNER_TEMP}/go-bridge-build" -GNinja -DCMAKE_BUILD_TYPE=Release -DOPENVPN3_SOURCE_DIR="${RUNNER_TEMP}/openvpn3-core"
+        cmake --build "${RUNNER_TEMP}/go-bridge-build" --parallel 2

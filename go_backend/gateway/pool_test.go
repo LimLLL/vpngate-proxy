@@ -51,11 +51,14 @@ func (f *fakeEndpoint) isClosed() bool {
 	return f.closed
 }
 
-// fakeNetwork connects instantly unless a node is marked as refusing.
+// fakeNetwork connects instantly unless a node is marked as refusing. Nodes
+// listed in egress report that public IP; others have an unknown egress.
 type fakeNetwork struct {
 	mu        sync.Mutex
 	refuse    map[string]bool
+	egress    map[string]string
 	endpoints map[string]*fakeEndpoint
+	devices   map[string]string
 	connects  int
 }
 
@@ -68,7 +71,17 @@ func (n *fakeNetwork) connect(_ context.Context, node nodes.Candidate, slot int)
 	}
 	endpoint := &fakeEndpoint{device: fmt.Sprintf("tun%d", slot), failed: make(chan struct{})}
 	n.endpoints[node.ID] = endpoint
+	n.devices[endpoint.device] = node.ID
 	return endpoint, nil
+}
+
+func (n *fakeNetwork) probe(_ context.Context, device string) (string, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if egress, ok := n.egress[n.devices[device]]; ok {
+		return egress, nil
+	}
+	return "", errors.New("no egress configured")
 }
 
 func (n *fakeNetwork) endpoint(id string) *fakeEndpoint {
@@ -99,22 +112,28 @@ type poolOptions struct {
 	maxTunnels int
 	minIdle    int
 	idle       time.Duration
+	egress     map[string]string // node ID to public IP; nil disables probing
 }
 
 func newTestPool(t *testing.T, registry *nodes.Registry, options poolOptions) (*Pool, *fakeNetwork) {
 	t.Helper()
-	network := &fakeNetwork{refuse: map[string]bool{}, endpoints: map[string]*fakeEndpoint{}}
+	network := &fakeNetwork{refuse: map[string]bool{}, egress: options.egress,
+		endpoints: map[string]*fakeEndpoint{}, devices: map[string]string{}}
 	if options.maxTunnels == 0 {
 		options.maxTunnels = 8
 	}
 	if options.idle == 0 {
 		options.idle = time.Hour
 	}
-	pool, err := NewPool(context.Background(), PoolConfig{
+	config := PoolConfig{
 		Nodes: registry, Connect: network.connect,
 		MaxTunnels: options.maxTunnels, MinIdle: options.minIdle, IdleTimeout: options.idle,
 		ConnectTimeout: time.Second, ConnectAttempts: 3, Logf: t.Logf,
-	})
+	}
+	if options.egress != nil {
+		config.Egress = network.probe
+	}
+	pool, err := NewPool(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,5 +347,43 @@ func TestConcurrentSessions(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+}
+
+// sharedEgress makes 10.0.0.1 and 10.0.0.2 leave through one NAT address,
+// like VPNGate's academic servers do, while 10.0.0.3 has its own.
+var sharedEgress = map[string]string{
+	"10.0.0.1": "198.51.100.1", "10.0.0.2": "198.51.100.1", "10.0.0.3": "198.51.100.3",
+}
+
+func TestExpiredSessionAvoidsSharedEgress(t *testing.T) {
+	pool, _ := newTestPool(t, testNodes(t, "JP", "JP", "JP"), poolOptions{egress: sharedEgress})
+	first := acquire(t, pool, Request{Session: "a", TTL: 50 * time.Millisecond})
+	time.Sleep(80 * time.Millisecond)
+	second := acquire(t, pool, Request{Session: "a", TTL: 50 * time.Millisecond})
+	if first.Egress != "198.51.100.1" || second.Egress != "198.51.100.3" {
+		t.Fatalf("rotation went from %s (%s) to %s (%s); another node behind the same NAT is not a new IP",
+			first.NodeID, first.Egress, second.NodeID, second.Egress)
+	}
+}
+
+func TestSessionsSpreadAcrossEgress(t *testing.T) {
+	pool, _ := newTestPool(t, testNodes(t, "JP", "JP", "JP"), poolOptions{egress: sharedEgress})
+	x := acquire(t, pool, Request{Session: "x", TTL: time.Minute})
+	y := acquire(t, pool, Request{Session: "y", TTL: time.Minute})
+	if x.Egress == y.Egress {
+		t.Fatalf("sessions share %s although another IP exists", x.Egress)
+	}
+}
+
+func TestRotationCyclesEgressIPs(t *testing.T) {
+	pool, _ := newTestPool(t, testNodes(t, "JP", "JP", "JP"), poolOptions{minIdle: 3, egress: sharedEgress})
+	eventually(t, "three warm tunnels", func() bool { return len(pool.Status().Tunnels) == 3 })
+	counts := map[string]int{}
+	for i := 0; i < 4; i++ {
+		counts[acquire(t, pool, Request{}).Egress]++
+	}
+	if counts["198.51.100.1"] != 2 || counts["198.51.100.3"] != 2 {
+		t.Fatalf("rotation should alternate between the two IPs, got %v", counts)
 	}
 }

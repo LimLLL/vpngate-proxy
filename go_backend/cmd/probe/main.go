@@ -6,12 +6,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/LimLLL/vpngate-proxy/go_backend/gateway"
@@ -60,7 +56,9 @@ func run() (resultErr error) {
 		"candidate": candidate.ID, "info": info, "proxy_verified": false,
 	}
 	if *target != "" {
-		egress, err := verifyEgress(context.Background(), info.TUNName, *target)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		egress, err := gateway.ProbeEgress(ctx, info.TUNName, *target)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -80,45 +78,6 @@ func run() (resultErr error) {
 	}
 	time.Sleep(*stay)
 	return nil
-}
-
-func verifyEgress(parent context.Context, device, target string) (string, error) {
-	dialer := gateway.DeviceDialer{Device: device, DNS: "8.8.8.8"}
-	transport := &http.Transport{DialContext: func(ctx context.Context, _ string, address string) (net.Conn, error) {
-		host, rawPort, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-		port := 80
-		if rawPort != "" {
-			if _, err := fmt.Sscanf(rawPort, "%d", &port); err != nil {
-				return nil, fmt.Errorf("invalid requested port %q", rawPort)
-			}
-		}
-		return dialer.DialContext(ctx, host, port)
-	}}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 25 * time.Second}
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return "", err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("verify public egress through %s: %w", device, err)
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, 256))
-	if err != nil {
-		return "", err
-	}
-	ip := net.ParseIP(strings.TrimSpace(string(body)))
-	if response.StatusCode != http.StatusOK || ip == nil || ip.To4() == nil {
-		return "", fmt.Errorf("public egress service returned invalid response: status=%d body=%q", response.StatusCode, body)
-	}
-	return ip.String(), nil
 }
 
 func main() {

@@ -10,21 +10,18 @@ import (
 	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
-// open connects to the best node not already live or being opened, trying up
-// to ConnectAttempts nodes. The returned tunnel is taken like in choose.
-func (p *Pool) open(ctx context.Context, country, exclude string, sticky bool) (*tunnel, error) {
+// open connects to the best nodes not already live or being opened, trying up
+// to ConnectAttempts of them, and returns the first tunnel the request can use,
+// taken like in choose. A tunnel that turns out to share an egress the
+// request must avoid is kept as a warm tunnel for others.
+func (p *Pool) open(ctx context.Context, country string, away avoid, sticky bool) (*tunnel, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return nil, errPoolClosed
 	}
-	slot := p.allocSlot()
-	if slot < 0 {
-		p.mu.Unlock()
-		return nil, fmt.Errorf("all %d tunnel slots are in use", p.config.MaxTunnels)
-	}
 	candidates := p.config.Nodes.Pick(nodes.Filter{Country: country, Exclude: func(id string) bool {
-		return id == exclude || p.tunnels[id] != nil || p.opening[id]
+		return id == away.node || p.tunnels[id] != nil || p.opening[id]
 	}}, time.Now())
 	if len(candidates) > p.config.ConnectAttempts {
 		candidates = candidates[:p.config.ConnectAttempts]
@@ -34,57 +31,90 @@ func (p *Pool) open(ctx context.Context, country, exclude string, sticky bool) (
 		p.opening[candidate.ID] = true
 	}
 	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		for _, candidate := range candidates {
+			delete(p.opening, candidate.ID)
+		}
+		p.notify()
+		p.mu.Unlock()
+	}()
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no unused node for country %q", country)
+	}
 
 	var failures []error
-	for i, candidate := range candidates {
+	for _, candidate := range candidates {
 		if ctx.Err() != nil {
 			failures = append(failures, ctx.Err())
 			break
 		}
-		connectCtx, cancel := context.WithTimeout(ctx, p.config.ConnectTimeout)
-		endpoint, err := p.config.Connect(connectCtx, candidate, slot)
-		cancel()
-		now := time.Now()
+		t, err := p.connect(ctx, candidate)
 		if err != nil {
-			// A caller that gave up says nothing about the node; a timeout does.
-			if ctx.Err() == nil {
-				p.config.Nodes.ReportFailure(candidate.ID, now)
-			}
-			p.config.Logf("connect %s (%s): %v", candidate.ID, candidate.Country, err)
 			failures = append(failures, fmt.Errorf("%s: %w", candidate.ID, err))
 			continue
 		}
-		p.config.Nodes.ReportSuccess(candidate.ID, now)
 		p.mu.Lock()
-		for _, reserved := range candidates[i:] {
-			delete(p.opening, reserved.ID)
+		usable := !away.blocks(t) && (!sticky || p.egressLoad(t) == 0)
+		if usable {
+			p.take(t, sticky)
 		}
-		p.notify()
-		if p.closed {
-			p.mu.Unlock()
-			t := &tunnel{node: candidate, device: endpoint.Device(), slot: slot, endpoint: endpoint, retired: true}
-			return nil, errors.Join(errPoolClosed, p.closeTunnel(t))
-		}
-		t := &tunnel{node: candidate, device: endpoint.Device(), slot: slot, endpoint: endpoint}
-		p.take(t, sticky)
-		p.tunnels[candidate.ID] = t
-		p.wg.Add(1)
-		go p.monitor(t)
 		p.mu.Unlock()
-		p.config.Logf("tunnel %s up via %s (%s)", t.device, candidate.ID, candidate.Country)
-		return t, nil
-	}
-	p.mu.Lock()
-	for _, reserved := range candidates {
-		delete(p.opening, reserved.ID)
-	}
-	p.slots[slot] = false
-	p.notify()
-	p.mu.Unlock()
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no unused node for country %q", country)
+		if usable {
+			return t, nil
+		}
+		p.config.Logf("tunnel %s egress %s is already taken; keeping it warm", t.device, t.egress)
+		failures = append(failures, fmt.Errorf("%s: egress %s is already taken", candidate.ID, t.egress))
 	}
 	return nil, errors.Join(failures...)
+}
+
+// connect opens one tunnel on a free slot, probes its egress and registers
+// it as live with no lease.
+func (p *Pool) connect(ctx context.Context, candidate nodes.Candidate) (*tunnel, error) {
+	p.mu.Lock()
+	slot := p.allocSlot()
+	p.mu.Unlock()
+	if slot < 0 {
+		return nil, fmt.Errorf("all %d tunnel slots are in use", p.config.MaxTunnels)
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, p.config.ConnectTimeout)
+	endpoint, err := p.config.Connect(connectCtx, candidate, slot)
+	cancel()
+	if err != nil {
+		p.mu.Lock()
+		p.slots[slot] = false
+		p.mu.Unlock()
+		// A caller that gave up says nothing about the node; a timeout does.
+		if ctx.Err() == nil {
+			p.config.Nodes.ReportFailure(candidate.ID, time.Now())
+		}
+		p.config.Logf("connect %s (%s): %v", candidate.ID, candidate.Country, err)
+		return nil, err
+	}
+	p.config.Nodes.ReportSuccess(candidate.ID, time.Now())
+	t := &tunnel{node: candidate, device: endpoint.Device(), slot: slot, endpoint: endpoint, lastUsed: time.Now()}
+	if p.config.Egress != nil {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		egress, err := p.config.Egress(probeCtx, t.device)
+		cancel()
+		if err != nil {
+			p.config.Logf("egress of %s unknown: %v", t.device, err)
+		}
+		t.egress = egress
+	}
+	p.mu.Lock()
+	if p.closed {
+		t.retired = true
+		p.mu.Unlock()
+		return nil, errors.Join(errPoolClosed, p.closeTunnel(t))
+	}
+	p.tunnels[candidate.ID] = t
+	p.wg.Add(1)
+	go p.monitor(t)
+	p.mu.Unlock()
+	p.config.Logf("tunnel %s up via %s (%s), egress %s", t.device, candidate.ID, candidate.Country, t.egress)
+	return t, nil
 }
 
 func (p *Pool) allocSlot() int {
@@ -229,7 +259,7 @@ func (p *Pool) warm() {
 		if done {
 			return
 		}
-		t, err := p.open(p.ctx, "", "", false)
+		t, err := p.open(p.ctx, "", avoid{}, false)
 		if err != nil {
 			p.config.Logf("warm tunnel: %v", err)
 			p.mu.Lock()

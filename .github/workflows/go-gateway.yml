@@ -7,7 +7,9 @@ on:
     paths:
       - "go_backend/**"
       - "scripts/test_session_gateway.sh"
+      - "scripts/testbed.sh"
       - ".github/workflows/go-gateway.yml"
+      - ".github/actions/native-core/**"
   workflow_dispatch:
     inputs:
       live:
@@ -29,26 +31,9 @@ jobs:
         with:
           go-version: "1.25.x"
           cache: false
-      - name: Install the verified native build dependencies
-        timeout-minutes: 5
-        run: |
-          sudo -E sh -c 'retry() { for attempt in 1 2 3 4 5 6; do "$@" && return 0; sleep 15; done; return 1; }; retry apt-get update; retry env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates cmake curl g++ git iproute2 ninja-build openvpn pkg-config libasio-dev libcap-dev libfmt-dev liblz4-dev libjsoncpp-dev libssl-dev libxxhash-dev iputils-ping'
-      - name: Check out the pinned official OpenVPN 3 Core
-        run: |
-          source_dir="${RUNNER_TEMP}/openvpn3-core"
-          git init "${source_dir}"
-          git -C "${source_dir}" remote add origin https://github.com/OpenVPN/openvpn3.git
-          git -C "${source_dir}" fetch --depth 1 origin master
-          git --version
-          git -C "${source_dir}" checkout --detach FETCH_HEAD
-          actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
-          printf 'Core HEAD: %s\nRequired Core: %s\n' "${actual_commit}" "${OPENVPN3_COMMIT}"
-          if [ "${actual_commit}" != "${OPENVPN3_COMMIT}" ]; then
-            printf 'The fetched Core is not the pinned revision\n' >&2
-            exit 1
-          fi
-      - name: Build the C ABI bridge and official Core with the verified settings
-        run: cmake -S go_backend -B "${RUNNER_TEMP}/go-bridge-build" -GNinja -DCMAKE_BUILD_TYPE=Release -DOPENVPN3_SOURCE_DIR="${RUNNER_TEMP}/openvpn3-core" && cmake --build "${RUNNER_TEMP}/go-bridge-build" --parallel 2
+      - uses: ./.github/actions/native-core
+        with:
+          core-commit: ${{ env.OPENVPN3_COMMIT }}
       - name: Build, vet and test the complete Go gateway
         env:
           CGO_ENABLED: "1"
@@ -116,6 +101,8 @@ jobs:
             --profile "${RUNNER_TEMP}/candidate.ovpn" --stay 5s --url "https://api.ipify.org" \
             --connected-file "${RUNNER_TEMP}/go-connected.json" >"${RUNNER_TEMP}/go-probe.log" 2>&1
           cat "${RUNNER_TEMP}/go-probe.log"
+          # The probe runs as root and writes 0600; the artifact upload runs as the runner user.
+          sudo chmod a+r "${RUNNER_TEMP}/go-connected.json"
 
       - name: Verify the proxy against public VPNGate nodes
         if: inputs.live

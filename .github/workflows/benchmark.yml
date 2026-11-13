@@ -1,0 +1,47 @@
+name: Engine benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      tunnels:
+        description: "Comma-separated concurrent tunnel counts, each 1-128"
+        required: true
+        default: "1,16,64,128"
+        type: string
+env:
+  OPENVPN3_COMMIT: 0b27d9df493db8bc9dc459a2b1cb6b67037742b2
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+          cache: false
+      - uses: ./.github/actions/native-core
+        with:
+          core-commit: ${{ env.OPENVPN3_COMMIT }}
+      - name: Build the benchmark
+        working-directory: go_backend
+        env:
+          CGO_ENABLED: "1"
+          CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
+          GOFLAGS: -buildvcs=false
+        run: go build -o "${RUNNER_TEMP}/vpngate-bench" ./cmd/bench
+      - name: Run Core and CLI against the controlled server
+        env:
+          TUNNELS: ${{ inputs.tunnels }}
+        run: |
+          sudo --preserve-env=PATH,RUNNER_TEMP,GITHUB_STEP_SUMMARY bash scripts/benchmark.sh \
+            "${TUNNELS}" "${RUNNER_TEMP}/vpngate-bench" "${RUNNER_TEMP}/bench-reports"
+      - name: Publish the benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: engine-benchmark-${{ github.run_number }}
+          path: ${{ runner.temp }}/bench-reports
+          if-no-files-found: warn
+          retention-days: 30
