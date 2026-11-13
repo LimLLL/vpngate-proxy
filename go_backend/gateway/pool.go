@@ -146,7 +146,7 @@ func NewPool(parent context.Context, config PoolConfig) (*Pool, error) {
 // Acquire returns a lease for one new proxy connection.
 func (p *Pool) Acquire(ctx context.Context, request Request) (*Lease, error) {
 	if request.Session == "" {
-		t, err := p.choose(ctx, request.Country, "", false)
+		t, err := p.choose(ctx, request.Country, avoid{}, false)
 		if err != nil {
 			return nil, err
 		}
