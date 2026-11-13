@@ -50,7 +50,7 @@ first() {
 
 {
   printf '## Engine benchmark\n\n'
-  printf '| Tunnels | Engine | Connected / traffic / stopped | Ready wall ms | Median / max connect ms | Max stop ms | Processes | Threads | RSS MiB | Peak RSS MiB | CPU ms |\n'
+  printf '| Tunnels | Engine | Connected / traffic / stopped | Ready wall ms | Median / max connect ms | Max stop ms | Processes | Threads | PSS MiB | RSS MiB | CPU ms |\n'
   printf '| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n'
   for count in "${list[@]}"; do
     for engine in core cli; do
@@ -59,12 +59,12 @@ first() {
         printf '| %s | %s | no report | | | | | | | | |\n' "${count}" "${engine}"
         continue
       fi
-      jq -r '"| \(.tunnels) | \(.engine) | \(.connected) / \(.traffic_ok) / \(.stopped) | \(.wall_ready_ms | round) | \(.median_connect_ms | round) / \(.max_connect_ms | round) | \(.max_stop_ms | round) | \(.processes) | \(.threads) | \(.rss_kb / 1024 * 10 | round / 10) | \(.peak_rss_kb / 1024 * 10 | round / 10) | \(.cpu_ms | round) |"' "${report}"
+      jq -r '"| \(.tunnels) | \(.engine) | \(.connected) / \(.traffic_ok) / \(.stopped) | \(.wall_ready_ms | round) | \(.median_connect_ms | round) / \(.max_connect_ms | round) | \(.max_stop_ms | round) | \(.processes) | \(.threads) | \(.pss_kb / 1024 * 10 | round / 10) | \(.rss_kb / 1024 * 10 | round / 10) | \(.cpu_ms | round) |"' "${report}"
     done
   done
   printf '\nCore rows are the whole benchmark process, including the Go controller (%s MiB before any tunnel). ' \
     "$(first core '.baseline_rss_kb / 1024 * 10 | round / 10')"
-  printf 'CLI rows sum the openvpn processes, so shared library pages are counted once per process. '
+  printf 'CLI rows sum the openvpn processes. PSS splits shared pages between processes; RSS counts them once per process. '
   printf 'Versions: %s / %s.\n' "$(first core .version)" "$(first cli .version)"
 } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
 exit "${status}"

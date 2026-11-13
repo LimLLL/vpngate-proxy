@@ -47,6 +47,7 @@ type report struct {
 	Processes       int             `json:"processes"`
 	Threads         int             `json:"threads"`
 	RSSKB           int             `json:"rss_kb"`
+	PSSKB           int             `json:"pss_kb"`
 	PeakRSSKB       int             `json:"peak_rss_kb"`
 	BaselineRSSKB   int             `json:"baseline_rss_kb"`
 	CPUMs           float64         `json:"cpu_ms"`
@@ -205,7 +206,8 @@ func run(selected engine, pattern, target string, connectTimeout, stopTimeout ti
 }
 
 // sampleEngine records resources while every tunnel is still up and after
-// traffic, so CPU covers handshakes plus the data path for both engines.
+// traffic, so CPU covers handshakes plus the data path for both engines. CPU
+// sums live threads only; both engines keep their threads until stopped.
 func sampleEngine(result *report, tunnels []tunnel) error {
 	var pids []string
 	for _, t := range tunnels {
@@ -224,6 +226,7 @@ func sampleEngine(result *report, tunnels []tunnel) error {
 		}
 		result.Threads += stats.threads
 		result.RSSKB += stats.rssKB
+		result.PSSKB += stats.pssKB
 		result.PeakRSSKB += stats.peakKB
 		result.CPUMs += stats.cpuMs
 	}

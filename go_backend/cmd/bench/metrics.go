@@ -3,19 +3,19 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
-
-// clockTicks is USER_HZ, the unit of utime/stime in /proc/<pid>/stat; Linux
-// exports it as 100 on every mainstream architecture.
-const clockTicks = 100
 
 type procStats struct {
 	threads int
 	rssKB   int
 	peakKB  int
-	cpuMs   float64
+	// pssKB charges shared pages proportionally, so a sum over processes
+	// does not count shared libraries once per process the way RSS does.
+	pssKB int
+	cpuMs float64
 }
 
 // readProc samples one process; pid may be "self".
@@ -35,22 +35,35 @@ func readProc(pid string) (procStats, error) {
 		}
 		*field.target = value
 	}
-	stat, err := os.ReadFile("/proc/" + pid + "/stat")
+	rollup, err := os.ReadFile("/proc/" + pid + "/smaps_rollup")
 	if err != nil {
 		return stats, err
 	}
-	// The command name may contain spaces, so fields are counted after ")".
-	_, rest, found := strings.Cut(string(stat), ") ")
-	fields := strings.Fields(rest)
-	if !found || len(fields) < 13 {
-		return stats, fmt.Errorf("/proc/%s/stat has an unexpected format", pid)
+	if stats.pssKB, err = statusValue(string(rollup), "Pss"); err != nil {
+		return stats, fmt.Errorf("/proc/%s/smaps_rollup: %w", pid, err)
 	}
-	utime, errUser := strconv.ParseFloat(fields[11], 64)
-	stime, errSystem := strconv.ParseFloat(fields[12], 64)
-	if errUser != nil || errSystem != nil {
-		return stats, fmt.Errorf("/proc/%s/stat has invalid CPU times", pid)
+	// schedstat has nanosecond run times; /proc/<pid>/stat rounds each
+	// process down to 10 ms ticks, which zeroes short-lived handshakes.
+	tasks, err := filepath.Glob("/proc/" + pid + "/task/*/schedstat")
+	if err != nil || len(tasks) == 0 {
+		return stats, fmt.Errorf("/proc/%s/task/*/schedstat is unavailable: %v", pid, err)
 	}
-	stats.cpuMs = (utime + stime) * 1000 / clockTicks
+	for _, task := range tasks {
+		data, err := os.ReadFile(task)
+		if err != nil {
+			// A thread may exit between listing and reading.
+			continue
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) == 0 {
+			return stats, fmt.Errorf("%s is empty", task)
+		}
+		nanoseconds, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil {
+			return stats, fmt.Errorf("%s: %w", task, err)
+		}
+		stats.cpuMs += nanoseconds / 1e6
+	}
 	return stats, nil
 }
 
