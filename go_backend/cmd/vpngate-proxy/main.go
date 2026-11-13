@@ -74,9 +74,7 @@ func run(dataDir string, printOnly bool) error {
 		IdleTimeout:     10 * time.Minute,
 		ConnectTimeout:  connectTimeout,
 		ConnectAttempts: 3,
-		Egress: func(ctx context.Context, device string) (string, error) {
-			return gateway.ProbeEgress(ctx, device, "https://api.ipify.org")
-		},
+		Egress:          probeEgress,
 	})
 	if err != nil {
 		return err
@@ -103,6 +101,22 @@ func run(dataDir string, printOnly bool) error {
 	}
 	stop()
 	return errors.Join(err, proxy.Close(), pool.Close(), registry.Save())
+}
+
+// probeEgress asks two independent IP echo services in turn, so one service
+// being down does not make every tunnel look dead.
+func probeEgress(ctx context.Context, device string) (string, error) {
+	var failures []error
+	for _, url := range []string{"https://api.ipify.org", "https://icanhazip.com"} {
+		attemptCtx, cancel := context.WithTimeout(ctx, 7*time.Second)
+		ip, err := gateway.ProbeEgress(attemptCtx, device, url)
+		cancel()
+		if err == nil {
+			return ip, nil
+		}
+		failures = append(failures, err)
+	}
+	return "", errors.Join(failures...)
 }
 
 // refresh merges one listing into the registry; failures are logged because

@@ -57,8 +57,8 @@ type PoolConfig struct {
 	ConnectAttempts int
 	// Egress reports the public IP seen through a new tunnel. Different nodes
 	// can share one NAT egress, so sessions are spread and rotated by this IP
-	// rather than by node. Nil, or a failed probe, leaves the egress unknown
-	// and each such tunnel counts as its own IP.
+	// rather than by node. A failed probe means the tunnel carries no traffic
+	// and it is dropped. With Egress nil every tunnel counts as its own IP.
 	Egress func(ctx context.Context, device string) (string, error)
 	Logf   func(string, ...any)
 }

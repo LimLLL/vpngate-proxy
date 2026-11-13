@@ -92,17 +92,24 @@ func (p *Pool) connect(ctx context.Context, candidate nodes.Candidate) (*tunnel,
 		p.config.Logf("connect %s (%s): %v", candidate.ID, candidate.Country, err)
 		return nil, err
 	}
-	p.config.Nodes.ReportSuccess(candidate.ID, time.Now())
 	t := &tunnel{node: candidate, device: endpoint.Device(), slot: slot, endpoint: endpoint, lastUsed: time.Now()}
 	if p.config.Egress != nil {
-		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		egress, err := p.config.Egress(probeCtx, t.device)
 		cancel()
 		if err != nil {
-			p.config.Logf("egress of %s unknown: %v", t.device, err)
+			// Some nodes finish the handshake but forward nothing; such a
+			// tunnel would only swallow requests.
+			t.retired = true
+			if ctx.Err() == nil {
+				p.config.Nodes.ReportFailure(candidate.ID, time.Now())
+			}
+			p.config.Logf("drop %s via %s: no traffic: %v", t.device, candidate.ID, err)
+			return nil, errors.Join(fmt.Errorf("no traffic through the tunnel: %w", err), p.closeTunnel(t))
 		}
 		t.egress = egress
 	}
+	p.config.Nodes.ReportSuccess(candidate.ID, time.Now())
 	p.mu.Lock()
 	if p.closed {
 		t.retired = true

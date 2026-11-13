@@ -387,3 +387,20 @@ func TestRotationCyclesEgressIPs(t *testing.T) {
 		t.Fatalf("rotation should alternate between the two IPs, got %v", counts)
 	}
 }
+
+func TestTunnelWithoutTrafficIsDropped(t *testing.T) {
+	registry := testNodes(t, "JP", "JP")
+	// 10.0.0.1 connects but its egress probe fails, as a dead node would.
+	pool, network := newTestPool(t, registry, poolOptions{egress: map[string]string{"10.0.0.2": "198.51.100.2"}})
+	if lease := acquire(t, pool, Request{Session: "a", TTL: time.Minute}); lease.NodeID != "10.0.0.2" {
+		t.Fatalf("expected the node that carries traffic, got %s", lease.NodeID)
+	}
+	if !network.endpoint("10.0.0.1").isClosed() {
+		t.Fatal("the silent tunnel was left open")
+	}
+	for _, candidate := range registry.Pick(nodes.Filter{}, time.Now()) {
+		if candidate.ID == "10.0.0.1" {
+			t.Fatal("the silent node is not cooling down")
+		}
+	}
+}
