@@ -19,22 +19,16 @@ socks5://同上
 
 需要一台 Linux 服务器（x86_64 或 arm64，镜像两种架构都有），装好 Docker 和 Docker Compose 插件，内核提供 `/dev/net/tun`（绝大多数 VPS 默认就有，没有的话先在服务商面板里开启 TUN/TAP）。
 
-**1. 登录 GHCR。** 仓库是私有的，镜像也是私有的，所以要先用 GitHub Personal Access Token（classic，勾选 `read:packages`）登录：
-
-```bash
-echo '<你的 token>' | docker login ghcr.io -u LimLLL --password-stdin
-```
-
-**2. 准备目录和 compose 文件。** 把仓库根目录的 [`compose.yaml`](compose.yaml) 放进部署目录（私有仓库的 raw 链接需要 token，直接复制内容最简单；装了 `gh` 的话也可以用下面的命令）：
+**1. 准备目录和 compose 文件。** 镜像 `ghcr.io/limlll/vpngate-proxy` 是公开的，不需要登录：
 
 ```bash
 mkdir -p /opt/vpngate-proxy && cd /opt/vpngate-proxy
-gh api repos/LimLLL/vpngate-proxy/contents/compose.yaml -H 'Accept: application/vnd.github.raw' > compose.yaml
+curl -fsSLO https://raw.githubusercontent.com/LimLLL/vpngate-proxy/main/compose.yaml
 ```
 
 默认把代理端口 7928 映射到宿主所有网卡；只想本机使用就把 `ports` 改成 `"127.0.0.1:7928:7928"`。
 
-**3. 启动并查看账号密码。** 首次启动会在 `./data/config.json` 生成随机账号和密码：
+**2. 启动并查看账号密码。** 首次启动会在 `./data/config.json` 生成随机账号和密码：
 
 ```bash
 docker compose up -d
@@ -42,7 +36,7 @@ docker compose exec vpngate-proxy vpngate-proxy --print-credentials
 docker compose logs -f   # 看节点拉取和隧道建立情况
 ```
 
-**4. 使用。** 把 `<服务器IP>`、账号、密码代入：
+**3. 使用。** 把 `<服务器IP>`、账号、密码代入：
 
 ```bash
 curl -x "http://<账号>:<密码>@<服务器IP>:7928" https://api.ipify.org                      # 每次换出口
