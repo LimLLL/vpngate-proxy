@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -153,70 +152,6 @@ func (r *Runtime) CheckPublicEgress(ctx context.Context, session string) (ProxyH
 	return ProxyHealth{Error: err.Error()}, err
 }
 
-func (r *Runtime) ConnectNode(id string) error {
-	if r.Catalog != nil {
-		node, err := r.Catalog.ByID(id)
-		if err != nil {
-			return err
-		}
-		cfg := r.Store.Snapshot()
-		cfg.FixedNodeID = node.String("id")
-		cfg.RoutingMode = "fixed_ip"
-		cfg.ConnectionEnabled = true
-		_, err = r.Store.Save(cfg)
-		return err
-	}
-	return errors.New("node catalog unavailable")
-}
-
-func (r *Runtime) Disconnect(disable bool) error {
-	cfg := r.Store.Snapshot()
-	cfg.ConnectionEnabled = !disable
-	if _, err := r.Store.Save(cfg); err != nil {
-		return err
-	}
-	if disable {
-		r.setMessage("已拒绝新的代理连接；存活连接与隧道按各自生命周期回收")
-	} else {
-		r.setMessage("已允许新的代理连接")
-	}
-	return nil
-}
-
-func (r *Runtime) State() map[string]any {
-	state := r.Store.State()
-	assigned, spare, sessions := r.Pool.Status()
-	r.mu.RLock()
-	health, message := r.ProxyHealth, r.Message
-	connecting := r.Connecting
-	r.mu.RUnlock()
-	cfg := state["connection_enabled"] == true
-	tunnelReady := len(sessions)+len(spare) > 0
-	state["tunnel_ready"] = cfg && tunnelReady
-	state["proxy_ready"] = cfg && health.OK
-	state["proxy_ok"] = cfg && health.OK
-	state["proxy_ip"] = health.IP
-	state["proxy_latency_ms"] = health.LatencyMS
-	state["proxy_error"] = health.Error
-	state["last_check_message"] = message
-	state["is_connecting"] = connecting
-	state["assigned_sessions"] = assigned
-	state["active_tunnel_count"] = len(sessions)
-	state["spare_tunnel_count"] = len(spare)
-	state["pending_tunnels"] = r.Pool.Pending()
-	state["active_openvpn_node_id"] = r.ActiveNode()
-	state["app_version"] = AppVersion
-	state["app_version_label"] = "V" + AppVersion + " Go 原生版"
-	state["deployment_mode"] = "go"
-	state["deployment_mode_label"] = "Go + OpenVPN 3 Core"
-	state["target_valid_nodes"] = min(4, len(sessions)+len(spare))
-	state["api_url"] = "https://www.vpngate.net/api/iphone/"
-	state["mirror_url"] = "https://limliu.github.io/vpngate-proxy/vpngate.csv"
-	state["fav_fail_fallback"] = false
-	state["maintenance_running"] = false
-	return state
-}
-
 func (r *Runtime) ActiveNode() string {
 	if !r.Store.Snapshot().ConnectionEnabled {
 		return ""
@@ -234,27 +169,6 @@ func (r *Runtime) ActiveNode() string {
 	return ""
 }
 
-func (r *Runtime) Services() []map[string]any {
-	assigned, spare, sessions := r.Pool.Status()
-	nativeRunning := len(sessions)+len(spare) > 0
-	r.mu.RLock()
-	lastCheck, lastDiscovery, lastPing := r.LastCheck, r.LastDiscovery, r.LastPing
-	r.mu.RUnlock()
-	nativeState := "stopped"
-	if nativeRunning {
-		nativeState = "running"
-	}
-	return []map[string]any{
-		{"name": "Web 管理服务", "status": "running", "details": "Go net/http 管理服务", "error": ""},
-		{"name": "本地代理网关", "status": "running", "details": r.ListenerAddr, "error": ""},
-		{"name": "OpenVPN 3 原生连接池", "status": nativeState,
-			"details": fmt.Sprintf("会话 %d，可用备用隧道 %d，创建中 %d", assigned, len(spare), r.Pool.Pending()), "error": ""},
-		{"name": "节点同步守护线程", "status": healthyDaemon(lastDiscovery, r.Started, 1*time.Hour), "details": lastDiscovery.String(), "error": ""},
-		{"name": "出口检测守护线程", "status": healthyDaemon(lastCheck, r.Started, 90*time.Second), "details": lastCheck.String(), "error": ""},
-		{"name": "延迟测速守护线程", "status": healthyDaemon(lastPing, r.Started, 45*time.Second), "details": lastPing.String(), "error": ""},
-	}
-}
-
 // SetPingResult records a physical-transport probe, not tunneled application RTT.
 func (r *Runtime) SetPingResult(latency int) {
 	r.mu.Lock()
@@ -265,11 +179,4 @@ func (r *Runtime) SetPingResult(latency int) {
 		display = fmt.Sprintf("%d ms", latency)
 	}
 	_ = r.Store.SetState(map[string]any{"active_node_latency": display})
-}
-
-func healthyDaemon(last, since time.Time, maximum time.Duration) string {
-	if time.Since(last) <= maximum || time.Since(since) <= maximum {
-		return "running"
-	}
-	return "stopped"
 }

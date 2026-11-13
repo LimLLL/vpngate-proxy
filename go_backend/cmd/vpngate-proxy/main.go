@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,7 +23,7 @@ import (
 func main() {
 	defaultDir := nonempty(os.Getenv("VPNGATE_DATA_DIR"), filepath.Join(".", "vpngate_data"))
 	dataDir := flag.String("data-dir", defaultDir, "private node and authentication directory")
-	printCredentials := flag.Bool("print-credentials", false, "print management and proxy credentials from this data directory")
+	printCredentials := flag.Bool("print-credentials", false, "print proxy credentials from this data directory")
 	initialize := flag.Bool("initialize", false, "write a new or migrated Go configuration, then exit")
 	flag.Parse()
 	if err := run(*dataDir, *initialize, *printCredentials); err != nil {
@@ -40,6 +39,8 @@ func run(dataDir string, initialize, printCredentials bool) error {
 	if err != nil {
 		return err
 	}
+	// Checked before normalization, which would otherwise mint an unsaved password.
+	initialized := store.Snapshot().Password != ""
 	cfg, err := normalizedConfig(store.Snapshot())
 	if err != nil {
 		return err
@@ -48,13 +49,13 @@ func run(dataDir string, initialize, printCredentials bool) error {
 		if _, err := store.Save(cfg); err != nil {
 			return err
 		}
-		return displayCredentials("http://"+net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))+"/"+cfg.SecretPath+"/", cfg)
+		return displayCredentials(cfg)
 	}
 	if printCredentials {
-		if cfg.Username == "" || cfg.Password == "" {
+		if !initialized {
 			return errors.New("no initialized credentials; run --initialize first on the data directory")
 		}
-		return displayCredentials("http://"+net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))+"/"+cfg.SecretPath+"/", cfg)
+		return displayCredentials(cfg)
 	}
 	if _, err := store.Save(cfg); err != nil {
 		return err
@@ -96,36 +97,15 @@ func run(dataDir string, initialize, printCredentials bool) error {
 	runtime.Proxy = proxy
 	catalog.Runtime = runtime
 
-	manager := web.NewServer(ctx, runtime)
-	manager.Restart = cancel
-	runtime.ListenerAddr = net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort))
-
 	proxyListener, err := listen(cfg.ProxyHost, cfg.ProxyPort)
 	if err != nil {
 		_ = pool.Close()
 		return fmt.Errorf("proxy listener: %w", err)
 	}
 	runtime.ListenerAddr = proxyListener.Addr().String()
-	uiListener, err := listen(cfg.Host, cfg.Port)
-	if err != nil {
-		_ = proxyListener.Close()
-		_ = pool.Close()
-		return fmt.Errorf("management listener: %w", err)
-	}
 	fmt.Printf("Go proxy: %s (mandatory session authentication)\n", runtime.ListenerAddr)
-	fmt.Printf("Management: http://%s/%s/\n", uiListener.Addr(), cfg.SecretPath)
-	fmt.Printf("Use session-<ID>-t-<minutes> and the management password, or LOCAL_PROXY_PASS.\n")
+	fmt.Printf("Use session-<ID>-t-<minutes> with the password from --print-credentials, or LOCAL_PROXY_PASS.\n")
 
-	server := &http.Server{
-		Handler: manager, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second,
-		WriteTimeout: 10 * time.Minute,
-	}
-	go func() {
-		if err := server.Serve(uiListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("management server: %v", err)
-			cancel()
-		}
-	}()
 	go func() {
 		if err := proxy.Serve(proxyListener); err != nil {
 			log.Printf("proxy server: %v", err)
@@ -137,9 +117,6 @@ func run(dataDir string, initialize, printCredentials bool) error {
 	go pingLoop(ctx, runtime)
 
 	<-ctx.Done()
-	shutdownCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
-	defer stop()
-	_ = server.Shutdown(shutdownCtx)
 	_ = proxy.Close()
 	if err := pool.Close(); err != nil {
 		return fmt.Errorf("native pool shutdown: %w", err)
@@ -208,27 +185,15 @@ func listen(host string, port int) (net.Listener, error) {
 func normalizedConfig(config web.Config) (web.Config, error) {
 	original := config
 	var err error
-	if config.Username == "" {
-		config.Username, err = web.RandomCredential(8)
-		if err != nil {
-			return config, err
-		}
-	}
 	if config.Password == "" {
 		config.Password, err = web.RandomCredential(32)
 		if err != nil {
 			return config, err
 		}
 	}
-	config.SecretPath = nonempty(config.SecretPath, "EJsW2EeBo9lY")
-	config.Host = nonempty(os.Getenv("UI_HOST"), nonempty(config.Host, "::"))
 	config.ProxyHost = nonempty(os.Getenv("LOCAL_PROXY_HOST"), nonempty(config.ProxyHost, "127.0.0.1"))
-	config.Port = envInteger("UI_PORT", config.Port)
 	config.ProxyPort = envInteger("LOCAL_PROXY_PORT", config.ProxyPort)
 	// Imported legacy JSON may omit newer port fields.
-	if original.Port == 0 && config.Port == 0 {
-		config.Port = 8787
-	}
 	if original.ProxyPort == 0 && config.ProxyPort == 0 {
 		config.ProxyPort = 7928
 	}
@@ -238,11 +203,8 @@ func normalizedConfig(config web.Config) (web.Config, error) {
 	if config.RoutingIPType == "" {
 		config.RoutingIPType = "all"
 	}
-	if config.SecretPath == "" || strings.Contains(config.SecretPath, "/") {
-		return config, errors.New("management secret path is invalid")
-	}
-	if config.Port < 1 || config.Port > 65535 || config.ProxyPort < 1024 || config.ProxyPort > 65535 || config.Port == config.ProxyPort {
-		return config, errors.New("management/proxy port configuration is invalid or conflicts")
+	if config.ProxyPort < 1024 || config.ProxyPort > 65535 {
+		return config, errors.New("proxy port configuration is invalid")
 	}
 	if config.RoutingMode != "auto" && config.RoutingMode != "fixed_ip" && config.RoutingMode != "fixed_region" && config.RoutingMode != "favorites" {
 		return config, errors.New("unknown saved routing mode")
@@ -250,9 +212,8 @@ func normalizedConfig(config web.Config) (web.Config, error) {
 	return config, nil
 }
 
-func displayCredentials(url string, cfg web.Config) error {
+func displayCredentials(cfg web.Config) error {
 	value := map[string]any{
-		"username": cfg.Username, "password": cfg.Password, "management_url": url,
 		"proxy_username_template": "session-<ID>-t-<minutes>", "proxy_password": nonempty(os.Getenv("LOCAL_PROXY_PASS"), cfg.Password),
 		"proxy_host": cfg.ProxyHost, "proxy_port": cfg.ProxyPort,
 	}

@@ -106,7 +106,7 @@ func (e *Catalog) Refresh(ctx context.Context) error {
 	e.mu.Lock()
 	e.nodes = fresh
 	e.lastFetch = time.Now()
-	e.lastSource = "VPNGate API / GitHub mirror / last-known cache"
+	e.lastSource = "VPNGate API / last-known cache"
 	e.mu.Unlock()
 	return nil
 }

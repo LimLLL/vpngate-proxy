@@ -1,9 +1,7 @@
 package web
 
 import (
-	"bufio"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -34,37 +32,6 @@ func AddLog(dir, level, module, message string) {
 		_, _ = file.Write(append(data, '\n'))
 		_ = file.Close()
 	}
-}
-
-func recentLogs(dir string) []map[string]any {
-	result := []map[string]any{}
-	auditMu.Lock()
-	defer auditMu.Unlock()
-	path := filepath.Join(dir, "logs", time.Now().Format("2006-01-02")+".json")
-	file, err := os.Open(path)
-	if err != nil {
-		return result
-	}
-	defer file.Close()
-	stat, err := file.Stat()
-	if err != nil || stat.Size() == 0 {
-		return result
-	}
-	if stat.Size() > 1024*1024 {
-		_, _ = file.Seek(-1024*1024, io.SeekEnd)
-	}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 1024), 128*1024)
-	for scanner.Scan() {
-		entry := make(map[string]any)
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
-			result = append(result, entry)
-		}
-	}
-	if len(result) > 500 {
-		result = result[len(result)-500:]
-	}
-	return result
 }
 
 func cleanupOldLogs(dir string) {

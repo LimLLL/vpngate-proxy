@@ -13,8 +13,9 @@ import (
 	"github.com/LimLLL/vpngate-proxy/go_backend/gateway"
 )
 
-// SnapshotFetcher loads source data without depending on the Python mirror
-// helper. Cache and bundled snapshots are fallbacks, never proof of connection.
+// SnapshotFetcher pulls the node list straight from the VPNGate API. The last
+// fetched copy and the bundled snapshot are offline fallbacks, never proof of
+// connection.
 type SnapshotFetcher struct {
 	Dir      string
 	Mirror   string
@@ -30,8 +31,6 @@ func (f *SnapshotFetcher) fetch(ctx context.Context, target *gateway.Source) err
 	urls := []string{
 		nonempty(os.Getenv("VPNGATE_API_HTTPS_URL"), "https://www.vpngate.net/api/iphone/"),
 		nonempty(os.Getenv("VPNGATE_API_HTTP_URL"), "http://www.vpngate.net/api/iphone/"),
-		nonempty(os.Getenv("VPNGATE_MIRROR_HTTPS_URL"), "https://limliu.github.io/vpngate-proxy/vpngate.csv"),
-		nonempty(os.Getenv("VPNGATE_MIRROR_HTTP_URL"), "http://limliu.github.io/vpngate-proxy/vpngate.csv"),
 	}
 	var failures []error
 	for _, address := range urls {

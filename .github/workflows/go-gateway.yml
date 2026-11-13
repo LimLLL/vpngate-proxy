@@ -60,9 +60,6 @@ jobs:
           go test -race -count=1 -timeout 120s ./...
           go vet ./...
           go build -o "${RUNNER_TEMP}/vpngate-proxy" ./cmd/vpngate-proxy
-          go run ./cmd/mirror --fixture "${GITHUB_WORKSPACE}/mirror/vpngate.csv" --output-dir "${RUNNER_TEMP}/go-mirror"
-          grep -q '"row_count":' "${RUNNER_TEMP}/go-mirror/vpngate.meta.json"
-          cmp "${GITHUB_WORKSPACE}/mirror/vpngate.csv" "${RUNNER_TEMP}/go-mirror/vpngate.csv"
 
       - name: Validate sticky, TTL and concurrent native sessions over real TUNs
         id: session_validation

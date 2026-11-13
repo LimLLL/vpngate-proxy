@@ -8,21 +8,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Config keeps the existing management JSON fields so existing deployments can
-// upgrade without moving secrets into node or proxy API responses.
+// Config is persisted in ui_auth.json; the file name predates the removal of
+// the management UI and is kept so existing data directories still load.
+// Password is the proxy password unless LOCAL_PROXY_PASS overrides it.
 type Config struct {
-	Username           string    `json:"username"`
 	Password           string    `json:"password"`
-	SecretPath         string    `json:"secret_path"`
-	Host               string    `json:"host"`
-	Port               int       `json:"port"`
 	ProxyHost          string    `json:"proxy_host"`
 	ProxyPort          int       `json:"proxy_port"`
 	RoutingMode        string    `json:"routing_mode"`
@@ -47,7 +43,6 @@ func NewDataStore(dir string) (*DataStore, error) {
 		return nil, errors.New("data directory is required")
 	}
 	config := Config{
-		SecretPath: "EJsW2EeBo9lY", Host: "::", Port: 8787,
 		ProxyHost: "127.0.0.1", ProxyPort: 7928, RoutingMode: "auto",
 		RoutingIPType: "all", ConnectionEnabled: true, FavoriteNodeIDs: []string{},
 		DiscoveryCountries: []string{},
@@ -60,7 +55,7 @@ func NewDataStore(dir string) (*DataStore, error) {
 	if data, err := os.ReadFile(filename); err == nil {
 		_ = os.Chmod(filename, 0o600)
 		if err := json.Unmarshal(data, &store.Config); err != nil {
-			return nil, fmt.Errorf("read management config: %w", err)
+			return nil, fmt.Errorf("read ui_auth.json: %w", err)
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, err
@@ -142,7 +137,7 @@ func intBetween(value any, fallback, low, high int) int {
 	return fallback
 }
 
-// RandomCredential generates only UI/session credentials, never a node profile.
+// RandomCredential generates only proxy credentials, never a node profile.
 func RandomCredential(length int) (string, error) {
 	if length < 1 || length > 256 {
 		return "", errors.New("credential length must be between 1 and 256")
@@ -152,32 +147,4 @@ func RandomCredential(length int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bytes)[:length], nil
-}
-
-var countryPattern = regexp.MustCompile(`^[A-Za-z]{2}$`)
-
-func normalizeCountries(input any) []string {
-	var result []string
-	seen := make(map[string]bool)
-	switch values := input.(type) {
-	case []any:
-		for _, value := range values {
-			text := strings.ToUpper(strings.TrimSpace(fmt.Sprint(value)))
-			if !countryPattern.MatchString(text) || seen[text] {
-				continue
-			}
-			seen[text] = true
-			result = append(result, text)
-		}
-	case []string:
-		for _, value := range values {
-			text := strings.ToUpper(strings.TrimSpace(value))
-			if !countryPattern.MatchString(text) || seen[text] {
-				continue
-			}
-			seen[text] = true
-			result = append(result, text)
-		}
-	}
-	return result
 }
