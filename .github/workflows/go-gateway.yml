@@ -10,6 +10,8 @@ on:
       - "scripts/testbed.sh"
       - ".github/workflows/go-gateway.yml"
       - ".github/actions/native-core/**"
+      - "Dockerfile"
+      - ".dockerignore"
   workflow_dispatch:
     inputs:
       live:

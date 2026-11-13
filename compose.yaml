@@ -1,0 +1,24 @@
+services:
+  vpngate-proxy:
+    image: ghcr.io/limlll/vpngate-proxy:latest
+    restart: unless-stopped
+    # Tunnels, policy routes and rp_filter live in the container's own network
+    # namespace, so the host routing table is never touched.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      # /proc/sys is read-only inside the container; replies arriving on the
+      # tunnels need loose reverse-path filtering.
+      net.ipv4.conf.all.rp_filter: 2
+      net.ipv4.conf.default.rp_filter: 2
+    ports:
+      # Use "127.0.0.1:7928:7928" to keep the proxy local to the host.
+      - "7928:7928"
+    volumes:
+      - ./data:/data
+    # Optional overrides of data/config.json, not written back to it:
+    # environment:
+    #   LOCAL_PROXY_USER: myaccount
+    #   LOCAL_PROXY_PASS: change-me

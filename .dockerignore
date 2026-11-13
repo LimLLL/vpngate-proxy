@@ -1,0 +1,5 @@
+# The image is built from go_backend alone.
+*
+!go_backend
+go_backend/**/*_test.go
+go_backend/nodes/testdata

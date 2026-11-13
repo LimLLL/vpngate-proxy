@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -121,15 +122,40 @@ func InstallRoute(device string, slot int) (func() error, error) {
 			return nil, fmt.Errorf("%s: %w: %s", strings.Join(command, " "), err, output)
 		}
 	}
-	// Loose reverse-path filtering, or replies arriving on the TUN are dropped.
+	if err := looseReversePath(device); err != nil {
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			log.Printf("roll back routes for %s: %v", device, cleanupErr)
+		}
+		return nil, err
+	}
+	return cleanup, nil
+}
+
+// looseReversePath makes sure replies arriving on device are not dropped by
+// strict reverse-path filtering. The kernel applies the larger of the "all"
+// and per-device values, so nothing is written when that is already 2 (loose):
+// containers usually mount /proc/sys read-only and preset it with --sysctl.
+func looseReversePath(device string) error {
+	effective := 0
+	for _, prefix := range []string{"all", device} {
+		data, err := os.ReadFile("/proc/sys/net/ipv4/conf/" + prefix + "/rp_filter")
+		if err != nil {
+			return err
+		}
+		value, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			return fmt.Errorf("rp_filter of %s: %w", prefix, err)
+		}
+		effective = max(effective, value)
+	}
+	if effective == 2 {
+		return nil
+	}
 	for _, prefix := range []string{"all", "default", device} {
 		key := "net.ipv4.conf." + prefix + ".rp_filter"
 		if output, err := exec.Command("sysctl", "-w", key+"=2").CombinedOutput(); err != nil {
-			if cleanupErr := cleanup(); cleanupErr != nil {
-				log.Printf("roll back routes for %s: %v", device, cleanupErr)
-			}
-			return nil, fmt.Errorf("%s=2: %w: %s", key, err, output)
+			return fmt.Errorf("%s=2 (in Docker, pass --sysctl net.ipv4.conf.all.rp_filter=2): %w: %s", key, err, output)
 		}
 	}
-	return cleanup, nil
+	return nil
 }

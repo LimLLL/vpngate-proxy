@@ -1,5 +1,6 @@
 # ---- 运行时数据 ----
 vpngate_data/
+data/
 logs/
 *.log
 *.tmp

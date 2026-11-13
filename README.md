@@ -15,21 +15,74 @@ socks5://同上
 | `user-session-abc-t-10` | 同一出口 IP 粘滞 10 分钟（默认 30），到期换到实测出口不同的隧道 |
 | `user-country-jp-session-abc` | 日本节点，粘滞 30 分钟 |
 
-## 运行
+## 部署（Docker）
 
-需要 Linux、root 和 `/dev/net/tun`。
+需要一台 Linux 服务器（x86_64），装好 Docker 和 Docker Compose 插件，内核提供 `/dev/net/tun`（绝大多数 VPS 默认就有，没有的话先在服务商面板里开启 TUN/TAP）。
+
+**1. 登录 GHCR。** 仓库是私有的，镜像也是私有的，所以要先用 GitHub Personal Access Token（classic，勾选 `read:packages`）登录：
 
 ```bash
-vpngate-proxy --data-dir ./vpngate_data --print-credentials  # 首次运行生成 config.json，并打印账号密码
-sudo vpngate-proxy --data-dir ./vpngate_data
+echo '<你的 token>' | docker login ghcr.io -u LimLLL --password-stdin
 ```
 
-数据目录：
+**2. 准备目录和 compose 文件。** 把仓库根目录的 [`compose.yaml`](compose.yaml) 放进部署目录（私有仓库的 raw 链接需要 token，直接复制内容最简单；装了 `gh` 的话也可以用下面的命令）：
 
-- `config.json`：账号、密码、监听地址、隧道数量（`max_tunnels`，默认 64）、预热隧道数（`min_idle_tunnels`，默认 4）、节点淘汰阈值（`node_max_age_days` 7、`node_max_failures` 5）、VPNGate API 地址。
-- `nodes.json`：累计的节点表。每 20 分钟拉一次 API，按 IP 去重合并；节点超过 `node_max_age_days` 没出现在列表里，或连续连接失败 `node_max_failures` 次，就被淘汰。
+```bash
+mkdir -p /opt/vpngate-proxy && cd /opt/vpngate-proxy
+gh api repos/LimLLL/vpngate-proxy/contents/compose.yaml -H 'Accept: application/vnd.github.raw' > compose.yaml
+```
 
-环境变量 `LOCAL_PROXY_USER`、`LOCAL_PROXY_PASS`、`LOCAL_PROXY_HOST`、`LOCAL_PROXY_PORT` 覆盖配置但不写回文件；对外服务设 `LOCAL_PROXY_HOST=0.0.0.0`。拉取节点列表遵循 `HTTPS_PROXY` / `HTTP_PROXY`。
+默认把代理端口 7928 映射到宿主所有网卡；只想本机使用就把 `ports` 改成 `"127.0.0.1:7928:7928"`。
+
+**3. 启动并查看账号密码。** 首次启动会在 `./data/config.json` 生成随机账号和密码：
+
+```bash
+docker compose up -d
+docker compose exec vpngate-proxy vpngate-proxy --print-credentials
+docker compose logs -f   # 看节点拉取和隧道建立情况
+```
+
+**4. 使用。** 把 `<服务器IP>`、账号、密码代入：
+
+```bash
+curl -x "http://<账号>:<密码>@<服务器IP>:7928" https://api.ipify.org                      # 每次换出口
+curl -x "http://<账号>-session-abc-t-10:<密码>@<服务器IP>:7928" https://api.ipify.org     # 10 分钟内固定出口
+curl -x "socks5h://<账号>-country-jp:<密码>@<服务器IP>:7928" https://api.ipify.org       # 只用日本节点
+```
+
+**更新与维护**
+
+- 升级：`docker compose pull && docker compose up -d`。`latest` 跟随 main 上测试通过的最新提交；也可以把镜像标签改成固定的 `sha-<提交前7位>` 或版本号。
+- 改账号、密码、隧道数量：编辑 `./data/config.json` 后 `docker compose restart`；或者在 `compose.yaml` 里用 `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` 覆盖。
+- `./data/nodes.json` 是累计的节点表，删掉后会从下一次 VPNGate 列表重新积累。
+- 服务器访问不了 `www.vpngate.net` 时，在 `compose.yaml` 的 `environment` 里加 `HTTPS_PROXY`（只用于拉节点列表）。
+
+容器需要 `NET_ADMIN` 和 `/dev/net/tun`；隧道、策略路由和 `rp_filter` 都在容器自己的网络命名空间里，不改宿主路由。镜像由 `.github/workflows/docker.yml` 在 "Go native gateway" 测试通过后构建并推送到 `ghcr.io/limlll/vpngate-proxy`；推 `v*` 标签会额外发布对应版本号。
+
+### 配置
+
+`./data/config.json`：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `username` / `password` | 随机生成 | 代理账号与密码 |
+| `proxy_host` / `proxy_port` | `127.0.0.1` / `7928` | 监听地址；镜像里由 `LOCAL_PROXY_HOST=0.0.0.0` 覆盖 |
+| `max_tunnels` | 64 | 同时存在的隧道上限 |
+| `min_idle_tunnels` | 4 | 保持预热、没有会话占用的隧道数 |
+| `node_max_age_days` / `node_max_failures` | 7 / 5 | 节点超过这么多天没出现在列表里、或连续失败这么多次就淘汰 |
+| `tun_base` | 0 | TUN 设备编号起点（`tun<tun_base+n>`） |
+| `api_urls` | VPNGate API 的 HTTPS 与 HTTP 地址 | 节点列表来源，按顺序尝试 |
+
+环境变量 `LOCAL_PROXY_USER`、`LOCAL_PROXY_PASS`、`LOCAL_PROXY_HOST`、`LOCAL_PROXY_PORT` 覆盖配置但不写回文件。
+
+### 不用 Docker
+
+需要 Linux、root 和 `/dev/net/tun`，自行按 `Dockerfile` 编译 OpenVPN 3 Core bridge 与 Go 程序后：
+
+```bash
+vpngate-proxy --data-dir ./vpngate_data --print-credentials
+sudo vpngate-proxy --data-dir ./vpngate_data
+```
 
 ## 目录
 
