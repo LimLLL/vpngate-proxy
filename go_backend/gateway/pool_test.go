@@ -174,12 +174,8 @@ func settled(pool *Pool) bool {
 
 // coolingDown reports whether the registry currently skips the node.
 func coolingDown(registry *nodes.Registry, id string) bool {
-	for _, node := range registry.Pick(nodes.Filter{}, time.Now()) {
-		if node.ID == id {
-			return false
-		}
-	}
-	return true
+	node, ok := registry.Get(id)
+	return !ok || time.Now().Before(node.RetryAfter)
 }
 
 func eventually(t *testing.T, what string, condition func() bool) {

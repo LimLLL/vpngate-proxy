@@ -71,7 +71,7 @@ func run(dataDir string, printOnly bool) error {
 		Connect:         gateway.NativeConnector(config.TUNBase, connectTimeout),
 		MaxTunnels:      config.MaxTunnels,
 		ConnectTimeout:  connectTimeout,
-		ConnectAttempts: 3,
+		ConnectAttempts: 5,
 		Egress:          probeEgress,
 	})
 	if err != nil {

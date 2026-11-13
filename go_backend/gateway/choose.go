@@ -134,13 +134,13 @@ func (p *Pool) reserve(country string, away avoid) *tunnel {
 		}
 	}
 	delete(inUse, "")
-	picked := p.config.Nodes.Pick(nodes.Filter{Country: country, Exclude: func(n nodes.Node) bool {
+	next, ok := p.config.Nodes.Next(nodes.Filter{Country: country, Exclude: func(n nodes.Node) bool {
 		return p.tunnels[n.ID] != nil || away.blocks(n.ID, n.Egress) || inUse[n.Egress]
 	}}, time.Now())
-	if len(picked) == 0 {
+	if !ok {
 		return nil
 	}
-	t := &tunnel{node: picked[0].Candidate, lastEgress: picked[0].Egress, slot: slot}
+	t := &tunnel{node: next.Candidate, lastEgress: next.Egress, slot: slot}
 	p.slots[slot] = true
 	p.tunnels[t.node.ID] = t
 	return t

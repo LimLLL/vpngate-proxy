@@ -25,9 +25,11 @@ type Endpoint interface {
 // tunnels and are reused only after the previous holder closed successfully.
 type Connector func(ctx context.Context, node nodes.Candidate, slot int) (Endpoint, error)
 
-// NodeSource is satisfied by *nodes.Registry.
+// NodeSource is satisfied by *nodes.Registry. Next both chooses a node and
+// counts it as used, which is what spreads consecutive and concurrent
+// connections across networks.
 type NodeSource interface {
-	Pick(nodes.Filter, time.Time) []nodes.Node
+	Next(nodes.Filter, time.Time) (nodes.Node, bool)
 	ReportSuccess(id, egress string, now time.Time)
 	ReportFailure(id string, now time.Time)
 	ReportUsed(egress string, now time.Time)

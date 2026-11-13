@@ -11,7 +11,7 @@ socks5://同上
 
 | 用户名 | 行为 |
 | --- | --- |
-| `user` | 每个新连接现连一个节点，优先最久没用过的出口 IP，连接结束即断开 |
+| `user` | 每个新连接现连一个节点，优先最久没用过的 /24 网段和出口 IP，连接结束即断开 |
 | `user-session-abc-t-60` | 同一出口 IP 粘滞 60 分钟（`t` 为 1–1440，默认 10），到期换到实测出口不同的节点 |
 | `user-country-jp-session-abc` | 日本节点，粘滞 10 分钟 |
 
@@ -85,7 +85,7 @@ sudo vpngate-proxy --data-dir ./vpngate_data
 | --- | --- |
 | `go_backend/core` | OpenVPN 3 Core 的 Go 封装 |
 | `go_backend/gateway` | 用户名解析、隧道池（按需连接与即时关闭、按实测出口 IP 分配与轮换、会话粘滞/TTL、健康检查）、HTTP/SOCKS5 代理 |
-| `go_backend/nodes` | VPNGate CSV 与 profile 校验、累计节点表（含各节点出口 IP 与出口最近使用时间）、API 拉取 |
+| `go_backend/nodes` | VPNGate CSV 与 profile 校验、累计节点表（含各节点出口 IP，及各网段、各出口的最近使用时间）、挑节点顺序、API 拉取 |
 | `go_backend/cmd/vpngate-proxy` | 主程序与配置 |
 | `go_backend/cmd/{bench,probe,candidate,testserver,testauth}` | 基准、真实节点探针与 CI 测试辅助程序 |
 

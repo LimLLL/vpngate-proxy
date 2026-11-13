@@ -36,13 +36,6 @@ type RegistryConfig struct {
 	Cooldown time.Duration
 }
 
-// Filter narrows Pick. Exclude is called while the registry is locked, so it
-// must not call back into the registry.
-type Filter struct {
-	Country string
-	Exclude func(Node) bool
-}
-
 // Registry accumulates every node seen in VPNGate listings, because each
 // listing only shows the servers online at that moment and IP variety is the
 // point of the proxy. Nodes leave by age or by repeated connect failures.
@@ -52,16 +45,15 @@ type Registry struct {
 
 	mu    sync.Mutex
 	nodes map[string]*Node
-	// egressUsed is when each egress IP was last in use, so picks can move
-	// on to the IP that has rested longest.
-	egressUsed map[string]time.Time
-	listed     time.Time
+	usage usage // what Next rotates by; persisted with the nodes
+	// listed is when the latest listing was merged; nodes seen then are in it.
+	listed time.Time
 }
 
 type registryFile struct {
-	ListedAt   time.Time            `json:"listed_at"`
-	EgressUsed map[string]time.Time `json:"egress_used,omitempty"`
-	Nodes      []Node               `json:"nodes"`
+	ListedAt time.Time `json:"listed_at"`
+	Usage    usage     `json:"usage"`
+	Nodes    []Node    `json:"nodes"`
 }
 
 // OpenRegistry loads the table from config.Path when the file exists.
@@ -69,7 +61,7 @@ func OpenRegistry(config RegistryConfig) (*Registry, error) {
 	if config.MaxAge <= 0 || config.MaxFailures < 1 || config.Cooldown < 0 {
 		return nil, errors.New("registry needs a positive max age and failure limit")
 	}
-	r := &Registry{config: config, nodes: make(map[string]*Node), egressUsed: make(map[string]time.Time)}
+	r := &Registry{config: config, nodes: make(map[string]*Node), usage: newUsage()}
 	if config.Path == "" {
 		return r, nil
 	}
@@ -88,9 +80,7 @@ func OpenRegistry(config RegistryConfig) (*Registry, error) {
 		node := file.Nodes[i]
 		r.nodes[node.ID] = &node
 	}
-	for egress, used := range file.EgressUsed {
-		r.egressUsed[egress] = used
-	}
+	r.usage.merge(file.Usage)
 	r.listed = file.ListedAt
 	return r, nil
 }
@@ -109,66 +99,14 @@ func (r *Registry) Merge(listing []Candidate, now time.Time) (added int, err err
 		added++
 	}
 	r.listed = now
-	known := make(map[string]bool)
 	for id, node := range r.nodes {
 		if now.Sub(node.LastSeen) > r.config.MaxAge {
 			delete(r.nodes, id)
-			continue
-		}
-		known[node.Egress] = true
-	}
-	for egress := range r.egressUsed {
-		if !known[egress] {
-			delete(r.egressUsed, egress)
 		}
 	}
+	r.usage.prune(r.nodes)
 	r.mu.Unlock()
 	return added, r.Save()
-}
-
-// Pick returns usable nodes, best first: the egress IP that has gone unused
-// longest (an unknown egress counts as never used), so consecutive picks move
-// between IPs rather than between nodes behind one NAT; then nodes in the
-// latest listing by VPNGate score; then older nodes by how recently they last
-// connected.
-func (r *Registry) Pick(filter Filter, now time.Time) []Node {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	var usable []*Node
-	for _, node := range r.nodes {
-		if filter.Country != "" && node.Country != filter.Country || now.Before(node.RetryAfter) {
-			continue
-		}
-		if filter.Exclude != nil && filter.Exclude(*node) {
-			continue
-		}
-		usable = append(usable, node)
-	}
-	sort.Slice(usable, func(i, j int) bool {
-		a, b := usable[i], usable[j]
-		if usedA, usedB := r.egressUsed[a.Egress], r.egressUsed[b.Egress]; !usedA.Equal(usedB) {
-			return usedA.Before(usedB)
-		}
-		listedA, listedB := !a.LastSeen.Before(r.listed), !b.LastSeen.Before(r.listed)
-		if listedA != listedB {
-			return listedA
-		}
-		if listedA && a.Score != b.Score {
-			return a.Score > b.Score
-		}
-		if !a.LastSuccess.Equal(b.LastSuccess) {
-			return a.LastSuccess.After(b.LastSuccess)
-		}
-		if !a.LastSeen.Equal(b.LastSeen) {
-			return a.LastSeen.After(b.LastSeen)
-		}
-		return a.ID < b.ID
-	})
-	result := make([]Node, len(usable))
-	for i, node := range usable {
-		result[i] = *node
-	}
-	return result
 }
 
 // ReportSuccess records a working connect and the egress IP measured through
@@ -184,21 +122,14 @@ func (r *Registry) ReportSuccess(id, egress string, now time.Time) {
 			node.Egress = egress
 		}
 	}
-	r.markUsed(egress, now)
+	r.usage.markIP(egress, now)
 }
 
 // ReportUsed records that egress was in use until now.
 func (r *Registry) ReportUsed(egress string, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.markUsed(egress, now)
-}
-
-// markUsed must be called with r.mu held.
-func (r *Registry) markUsed(egress string, now time.Time) {
-	if egress != "" {
-		r.egressUsed[egress] = now
-	}
+	r.usage.markIP(egress, now)
 }
 
 // ReportFailure puts the node on cooldown, or drops it at the failure limit.
@@ -217,6 +148,16 @@ func (r *Registry) ReportFailure(id string, now time.Time) {
 	node.RetryAfter = now.Add(r.config.Cooldown)
 }
 
+// Get returns a copy of one node.
+func (r *Registry) Get(id string) (Node, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if node, ok := r.nodes[id]; ok {
+		return *node, true
+	}
+	return Node{}, false
+}
+
 func (r *Registry) Len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -232,14 +173,11 @@ func (r *Registry) Save() error {
 	r.saveMu.Lock()
 	defer r.saveMu.Unlock()
 	r.mu.Lock()
-	file := registryFile{ListedAt: r.listed, EgressUsed: make(map[string]time.Time, len(r.egressUsed)),
-		Nodes: make([]Node, 0, len(r.nodes))}
+	file := registryFile{ListedAt: r.listed, Usage: newUsage(), Nodes: make([]Node, 0, len(r.nodes))}
 	for _, node := range r.nodes {
 		file.Nodes = append(file.Nodes, *node)
 	}
-	for egress, used := range r.egressUsed {
-		file.EgressUsed[egress] = used
-	}
+	file.Usage.merge(r.usage)
 	r.mu.Unlock()
 	sort.Slice(file.Nodes, func(i, j int) bool { return file.Nodes[i].ID < file.Nodes[j].ID })
 	data, err := json.Marshal(file)

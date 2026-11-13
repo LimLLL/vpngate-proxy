@@ -96,7 +96,9 @@ rotated=$(check "${user}-session-s1-t-1")
 [[ "${rotated}" != "${sticky}" ]] || fail "session s1 kept ${sticky} after its TTL"
 
 distinct=$(printf '%s\n' "${rotating[@]}" | sort -u | wc -l)
-summary "" "- Rotating requests used ${distinct} distinct IPs out of ${#rotating[@]}."
-(( distinct >= 2 )) || fail "rotating requests all left through ${rotating[0]}"
+networks=$(printf '%s\n' "${rotating[@]}" | cut -d. -f1-3 | sort -u | wc -l)
+summary "" "- Rotating requests used ${distinct} distinct IPs in ${networks} /24 networks out of ${#rotating[@]}."
+# Rotation moves between /24 networks, so most requests should land in a new one.
+(( networks >= 3 )) || fail "rotating requests stayed within ${networks} /24 networks"
 summary "- \`country-jp\` egress ${japan} geolocates to \`${japan_code:-unknown}\` (ip-api; informational)."
 summary "- Sticky, distinct-session and TTL rotation checks passed."
