@@ -36,8 +36,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/bridge/libvpngate_bridge.so /usr/local/lib/
 COPY --from=build /out/vpngate-proxy /usr/local/bin/
-# Fail the build, not the first start, if a runtime library is missing.
-RUN ldconfig && ! ldd /usr/local/bin/vpngate-proxy /usr/local/lib/libvpngate_bridge.so | grep -F "not found"
+# Fail the build, not the first start, if a runtime library is missing or the
+# binary cannot start on this architecture (--print-credentials needs no TUN).
+RUN ldconfig && ! ldd /usr/local/bin/vpngate-proxy /usr/local/lib/libvpngate_bridge.so | grep -F "not found" \
+    && vpngate-proxy --data-dir /tmp/smoke --print-credentials > /dev/null \
+    && rm -rf /tmp/smoke
 ENV VPNGATE_DATA_DIR=/data LOCAL_PROXY_HOST=0.0.0.0
 VOLUME ["/data"]
 EXPOSE 7928/tcp

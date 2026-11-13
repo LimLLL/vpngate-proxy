@@ -17,7 +17,7 @@ socks5://同上
 
 ## 部署（Docker）
 
-需要一台 Linux 服务器（x86_64），装好 Docker 和 Docker Compose 插件，内核提供 `/dev/net/tun`（绝大多数 VPS 默认就有，没有的话先在服务商面板里开启 TUN/TAP）。
+需要一台 Linux 服务器（x86_64 或 arm64，镜像两种架构都有），装好 Docker 和 Docker Compose 插件，内核提供 `/dev/net/tun`（绝大多数 VPS 默认就有，没有的话先在服务商面板里开启 TUN/TAP）。
 
 **1. 登录 GHCR。** 仓库是私有的，镜像也是私有的，所以要先用 GitHub Personal Access Token（classic，勾选 `read:packages`）登录：
 
@@ -57,7 +57,7 @@ curl -x "socks5h://<账号>-country-jp:<密码>@<服务器IP>:7928" https://api.
 - `./data/nodes.json` 是累计的节点表，删掉后会从下一次 VPNGate 列表重新积累。
 - 服务器访问不了 `www.vpngate.net` 时，在 `compose.yaml` 的 `environment` 里加 `HTTPS_PROXY`（只用于拉节点列表）。
 
-容器需要 `NET_ADMIN` 和 `/dev/net/tun`；隧道、策略路由和 `rp_filter` 都在容器自己的网络命名空间里，不改宿主路由。镜像由 `.github/workflows/docker.yml` 在 "Go native gateway" 测试通过后构建并推送到 `ghcr.io/limlll/vpngate-proxy`；推 `v*` 标签会额外发布对应版本号。
+容器需要 `NET_ADMIN` 和 `/dev/net/tun`；隧道、策略路由和 `rp_filter` 都在容器自己的网络命名空间里，不改宿主路由。镜像由 `.github/workflows/docker.yml` 在 "Go native gateway" 测试通过后，分别在 x86_64 和 arm64 原生 runner 上构建，合并成多架构镜像推送到 `ghcr.io/limlll/vpngate-proxy`；推 `v*` 标签会额外发布对应版本号。
 
 ### 配置
 
