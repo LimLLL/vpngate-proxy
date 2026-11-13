@@ -86,12 +86,14 @@ jobs:
           CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
         run: go test -race ./core -run 'Test(RealVPNGateProfileEvalAndRelease|FailedNativeConnectionCanBeClosed)$' -v
 
-      - name: Compile the race-enabled public VPNGate probe
+      - name: Compile the public VPNGate probe
         if: inputs.live
         working-directory: go_backend
         env:
           CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
-        run: go build -race -o "${RUNNER_TEMP}/vpngate-go-probe" ./cmd/probe
+        # Without -race: a race build exits through C exit() and Core's C++
+        # static destructors, which can hang (see core/main_test.go).
+        run: go build -o "${RUNNER_TEMP}/vpngate-go-probe" ./cmd/probe
 
       - name: Verify actual public egress and native stop
         if: inputs.live
