@@ -11,9 +11,11 @@ socks5://同上
 
 | 用户名 | 行为 |
 | --- | --- |
-| `user` | 每个新连接轮换出口 |
-| `user-session-abc-t-10` | 同一出口 IP 粘滞 10 分钟（默认 30），到期换到实测出口不同的隧道 |
-| `user-country-jp-session-abc` | 日本节点，粘滞 30 分钟 |
+| `user` | 每个新连接现连一个节点，优先最久没用过的出口 IP，连接结束即断开 |
+| `user-session-abc-t-60` | 同一出口 IP 粘滞 60 分钟（`t` 为 1–1440，默认 10），到期换到实测出口不同的节点 |
+| `user-country-jp-session-abc` | 日本节点，粘滞 10 分钟 |
+
+隧道按需建立，不预热：每个轮换连接和每个会话的第一个连接都要先连上 VPNGate 节点（通常 2–8 秒，遇到坏节点会换下一个重试），会话在有效期内的后续连接直接复用。经隧道的 DNS 或连接超时会触发出口探测，隧道已失效就下线并换一条重试；会话隧道空闲时每分钟探测一次。
 
 ## 部署（Docker）
 
@@ -48,7 +50,7 @@ curl -x "socks5h://<账号>-country-jp:<密码>@<服务器IP>:7928" https://api.
 
 - 升级：`docker compose pull && docker compose up -d`。`latest` 跟随 main 上测试通过的最新提交；也可以把镜像标签改成固定的 `sha-<提交前7位>` 或版本号。
 - 改账号、密码、隧道数量：编辑 `./data/config.json` 后 `docker compose restart`；或者在 `compose.yaml` 里用 `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` 覆盖。
-- `./data/nodes.json` 是累计的节点表，删掉后会从下一次 VPNGate 列表重新积累。
+- `./data/nodes.json` 是累计的节点表，也记着每个节点实测过的出口 IP；删掉后会从下一次 VPNGate 列表重新积累。
 - 服务器访问不了 `www.vpngate.net` 时，在 `compose.yaml` 的 `environment` 里加 `HTTPS_PROXY`（只用于拉节点列表）。
 
 容器需要 `NET_ADMIN` 和 `/dev/net/tun`；隧道、策略路由和 `rp_filter` 都在容器自己的网络命名空间里，不改宿主路由。镜像由 `.github/workflows/docker.yml` 在 "Go native gateway" 测试通过后，分别在 x86_64 和 arm64 原生 runner 上构建，合并成多架构镜像推送到 `ghcr.io/limlll/vpngate-proxy`；推 `v*` 标签会额外发布对应版本号。
@@ -61,8 +63,7 @@ curl -x "socks5h://<账号>-country-jp:<密码>@<服务器IP>:7928" https://api.
 | --- | --- | --- |
 | `username` / `password` | 随机生成 | 代理账号与密码 |
 | `proxy_host` / `proxy_port` | `127.0.0.1` / `7928` | 监听地址；镜像里由 `LOCAL_PROXY_HOST=0.0.0.0` 覆盖 |
-| `max_tunnels` | 64 | 同时存在的隧道上限 |
-| `min_idle_tunnels` | 4 | 保持预热、没有会话占用的隧道数 |
+| `max_tunnels` | 64 | 同时存在的隧道上限；满了以后新连接共用现有隧道 |
 | `node_max_age_days` / `node_max_failures` | 7 / 5 | 节点超过这么多天没出现在列表里、或连续失败这么多次就淘汰 |
 | `tun_base` | 0 | TUN 设备编号起点（`tun<tun_base+n>`） |
 | `api_urls` | VPNGate API 的 HTTPS 与 HTTP 地址 | 节点列表来源，按顺序尝试 |
@@ -83,14 +84,14 @@ sudo vpngate-proxy --data-dir ./vpngate_data
 | 路径 | 内容 |
 | --- | --- |
 | `go_backend/core` | OpenVPN 3 Core 的 Go 封装 |
-| `go_backend/gateway` | 用户名解析、隧道池（每节点一条隧道、按实测出口 IP 分配与轮换、会话粘滞/TTL、预热与回收）、HTTP/SOCKS5 代理 |
-| `go_backend/nodes` | VPNGate CSV 与 profile 校验、累计节点表、API 拉取 |
+| `go_backend/gateway` | 用户名解析、隧道池（按需连接与即时关闭、按实测出口 IP 分配与轮换、会话粘滞/TTL、健康检查）、HTTP/SOCKS5 代理 |
+| `go_backend/nodes` | VPNGate CSV 与 profile 校验、累计节点表（含各节点出口 IP 与出口最近使用时间）、API 拉取 |
 | `go_backend/cmd/vpngate-proxy` | 主程序与配置 |
 | `go_backend/cmd/{bench,probe,candidate,testserver,testauth}` | 基准、真实节点探针与 CI 测试辅助程序 |
 
 ## 测试
 
-本地不编译、不测试；全部在 GitHub Actions 中执行。`go-gateway.yml` 编译固定版本的 OpenVPN 3 Core，跑 Go 单测和 vet，再在受控 OpenVPN 服务端上用真实 TUN 验证粘滞、TTL 换节点和长连接存活。`live=true` 时再启动真实代理连 VPNGate 节点，检查轮换、粘滞、会话间换 IP 和 TTL 换 IP：
+本地不编译、不测试；全部在 GitHub Actions 中执行。`go-gateway.yml` 编译固定版本的 OpenVPN 3 Core，跑 Go 单测和 vet，再在受控 OpenVPN 服务端上用真实 TUN 验证粘滞、TTL 换节点和长连接存活。`live=true` 时再启动真实代理连 VPNGate 节点，检查轮换请求拿到多个不同 IP、粘滞、会话间换 IP 和 TTL 换 IP：
 
 ```bash
 gh workflow run go-gateway.yml --repo LimLLL/vpngate-proxy -f live=true

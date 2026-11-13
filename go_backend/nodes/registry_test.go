@@ -19,10 +19,10 @@ func node(id, country string, score int) Candidate {
 	return Candidate{ID: id, IP: id, Country: country, Score: score, Profile: "profile-" + id}
 }
 
-func ids(candidates []Candidate) []string {
-	result := make([]string, len(candidates))
-	for i, candidate := range candidates {
-		result[i] = candidate.ID
+func ids(picked []Node) []string {
+	result := make([]string, len(picked))
+	for i, node := range picked {
+		result[i] = node.ID
 	}
 	return result
 }
@@ -67,13 +67,13 @@ func TestRegistryOrdersListedThenRecentlySuccessful(t *testing.T) {
 	registry := testRegistry(t, "")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	registry.Merge([]Candidate{node("old-ok", "JP", 1), node("old-never", "JP", 99)}, now)
-	registry.ReportSuccess("old-ok", now)
+	registry.ReportSuccess("old-ok", "", now)
 	registry.Merge([]Candidate{node("low", "JP", 10), node("high", "JP", 20)}, now.Add(time.Minute))
 	got := ids(registry.Pick(Filter{}, now.Add(time.Minute)))
 	if want := []string{"high", "low", "old-ok", "old-never"}; !equal(got, want) {
 		t.Fatalf("order %v, want %v", got, want)
 	}
-	got = ids(registry.Pick(Filter{Exclude: func(id string) bool { return id == "high" }}, now.Add(time.Minute)))
+	got = ids(registry.Pick(Filter{Exclude: func(n Node) bool { return n.ID == "high" }}, now.Add(time.Minute)))
 	if !equal(got, []string{"low", "old-ok", "old-never"}) {
 		t.Fatalf("exclude ignored: %v", got)
 	}
@@ -90,7 +90,7 @@ func TestRegistryCooldownAndFailureLimit(t *testing.T) {
 	if len(registry.Pick(Filter{}, now.Add(11*time.Minute))) != 1 {
 		t.Fatal("the node should return after its cooldown")
 	}
-	registry.ReportSuccess("a", now)
+	registry.ReportSuccess("a", "", now)
 	registry.ReportFailure("a", now)
 	registry.ReportFailure("a", now)
 	if registry.Len() != 1 {
@@ -102,20 +102,42 @@ func TestRegistryCooldownAndFailureLimit(t *testing.T) {
 	}
 }
 
+func TestRegistryPrefersTheLeastRecentlyUsedEgress(t *testing.T) {
+	registry := testRegistry(t, "")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// a and b sit behind one NAT; c has not been measured yet.
+	registry.Merge([]Candidate{node("a", "JP", 30), node("b", "JP", 20), node("c", "JP", 10), node("d", "JP", 5)}, now)
+	registry.ReportSuccess("a", "198.51.100.1", now)
+	registry.ReportSuccess("b", "198.51.100.1", now.Add(time.Minute))
+	registry.ReportSuccess("d", "198.51.100.4", now.Add(2*time.Minute))
+	if got, want := ids(registry.Pick(Filter{}, now.Add(time.Hour))), []string{"c", "a", "b", "d"}; !equal(got, want) {
+		t.Fatalf("order %v, want %v: unknown egress first, then the IP unused longest", got, want)
+	}
+	registry.ReportUsed("198.51.100.1", now.Add(3*time.Minute))
+	if got, want := ids(registry.Pick(Filter{}, now.Add(time.Hour))), []string{"c", "d", "a", "b"}; !equal(got, want) {
+		t.Fatalf("order %v, want %v after the shared IP was used again", got, want)
+	}
+}
+
 func TestRegistryPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nodes.json")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	registry := testRegistry(t, path)
-	registry.Merge([]Candidate{node("a", "JP", 1), node("b", "US", 2)}, now)
+	registry.Merge([]Candidate{node("a", "JP", 1), node("b", "US", 2), node("c", "US", 3)}, now)
 	registry.ReportFailure("a", now)
+	registry.ReportSuccess("b", "198.51.100.2", now)
 	if err := registry.Save(); err != nil {
 		t.Fatal(err)
 	}
 	reopened := testRegistry(t, path)
-	if reopened.Len() != 2 {
+	if reopened.Len() != 3 {
 		t.Fatalf("reopened registry has %d nodes", reopened.Len())
 	}
-	if got := ids(reopened.Pick(Filter{}, now.Add(time.Minute))); !equal(got, []string{"b"}) {
-		t.Fatalf("cooldown was not persisted: %v", got)
+	got := reopened.Pick(Filter{}, now.Add(time.Minute))
+	if !equal(ids(got), []string{"c", "b"}) {
+		t.Fatalf("cooldown or egress use was not persisted: %v", ids(got))
+	}
+	if got[1].Egress != "198.51.100.2" {
+		t.Fatalf("egress was not persisted: %+v", got[1])
 	}
 }

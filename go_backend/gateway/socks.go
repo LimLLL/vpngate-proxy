@@ -60,26 +60,31 @@ func (p *Proxy) handleSocks(client net.Conn, reader *bufio.Reader) {
 		writeSocksReply(client, 8)
 		return
 	}
-	ctx, cancel := context.WithTimeout(p.ctx, 45*time.Second)
-	defer cancel()
-	lease, egress, err := p.acquireTunnel(ctx, username, password)
+	wanted, err := p.authenticate(username, password)
 	if err != nil {
-		log.Printf("SOCKS5 %q: %v", username, err)
-		// 0x02 "not allowed by ruleset" for client errors, 0x01 general failure otherwise.
+		writeSocksReply(client, 2)
+		return
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, dialBudget)
+	defer cancel()
+	// Connecting a node can outlast the deadline for reading the request.
+	_ = client.SetDeadline(time.Time{})
+	lease, upstream, err := p.dial(ctx, wanted, host, port)
+	if err != nil {
+		log.Printf("SOCKS5 %q %s:%d: %v", username, host, port, err)
+		// 0x02 "not allowed by ruleset" for client errors, 0x04 "host
+		// unreachable" past a working tunnel, 0x01 general failure otherwise.
 		code := byte(1)
-		if rejected(err) {
+		switch {
+		case rejected(err):
 			code = 2
+		case errors.As(err, new(dialError)):
+			code = 4
 		}
 		writeSocksReply(client, code)
 		return
 	}
 	defer lease.Release()
-	upstream, err := egress.DialContext(ctx, host, port)
-	if err != nil {
-		log.Printf("%s SOCKS5 %s:%d: %v", lease.Device, host, port, err)
-		writeSocksReply(client, 4)
-		return
-	}
 	defer upstream.Close()
 	if !writeSocksReply(client, 0) {
 		return

@@ -43,10 +43,16 @@ func (d DeviceDialer) DialContext(ctx context.Context, host string, port int) (n
 	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
 }
 
+// dnsTimeout bounds one lookup. A tunnel that silently drops packets would
+// otherwise hold it for the resolver's retries across every resolv.conf server.
+const dnsTimeout = 10 * time.Second
+
 func (d DeviceDialer) ResolveIPv4(ctx context.Context, host string) ([]net.IP, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return []net.IP{ip}, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, dnsTimeout)
+	defer cancel()
 	resolver := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
 		dialer := net.Dialer{Control: func(_ string, _ string, raw syscall.RawConn) error {
 			var bindErr error

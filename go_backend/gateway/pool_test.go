@@ -52,10 +52,12 @@ func (f *fakeEndpoint) isClosed() bool {
 }
 
 // fakeNetwork connects instantly unless a node is marked as refusing. Nodes
-// listed in egress report that public IP; others have an unknown egress.
+// listed in egress report that public IP; others, and dead ones, fail the
+// probe.
 type fakeNetwork struct {
 	mu        sync.Mutex
 	refuse    map[string]bool
+	dead      map[string]bool
 	egress    map[string]string
 	endpoints map[string]*fakeEndpoint
 	devices   map[string]string
@@ -78,10 +80,18 @@ func (n *fakeNetwork) connect(_ context.Context, node nodes.Candidate, slot int)
 func (n *fakeNetwork) probe(_ context.Context, device string) (string, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if egress, ok := n.egress[n.devices[device]]; ok {
+	id := n.devices[device]
+	if egress, ok := n.egress[id]; ok && !n.dead[id] {
 		return egress, nil
 	}
-	return "", errors.New("no egress configured")
+	return "", errors.New("no reply through the tunnel")
+}
+
+// kill makes a connected node stop forwarding without dropping the tunnel.
+func (n *fakeNetwork) kill(id string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.dead[id] = true
 }
 
 func (n *fakeNetwork) endpoint(id string) *fakeEndpoint {
@@ -110,25 +120,20 @@ func testNodes(t *testing.T, countries ...string) *nodes.Registry {
 
 type poolOptions struct {
 	maxTunnels int
-	minIdle    int
-	idle       time.Duration
+	health     time.Duration
 	egress     map[string]string // node ID to public IP; nil disables probing
 }
 
 func newTestPool(t *testing.T, registry *nodes.Registry, options poolOptions) (*Pool, *fakeNetwork) {
 	t.Helper()
-	network := &fakeNetwork{refuse: map[string]bool{}, egress: options.egress,
+	network := &fakeNetwork{refuse: map[string]bool{}, dead: map[string]bool{}, egress: options.egress,
 		endpoints: map[string]*fakeEndpoint{}, devices: map[string]string{}}
 	if options.maxTunnels == 0 {
 		options.maxTunnels = 8
 	}
-	if options.idle == 0 {
-		options.idle = time.Hour
-	}
 	config := PoolConfig{
-		Nodes: registry, Connect: network.connect,
-		MaxTunnels: options.maxTunnels, MinIdle: options.minIdle, IdleTimeout: options.idle,
-		ConnectTimeout: time.Second, ConnectAttempts: 3, Logf: t.Logf,
+		Nodes: registry, Connect: network.connect, MaxTunnels: options.maxTunnels,
+		ConnectTimeout: time.Second, ConnectAttempts: 3, HealthInterval: options.health, Logf: t.Logf,
 	}
 	if options.egress != nil {
 		config.Egress = network.probe
@@ -153,6 +158,28 @@ func acquire(t *testing.T, pool *Pool, request Request) *Lease {
 	}
 	t.Cleanup(lease.Release)
 	return lease
+}
+
+// settled reports whether every tunnel has finished connecting or closing.
+func settled(pool *Pool) bool {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	for _, t := range pool.tunnels {
+		if !t.live() {
+			return false
+		}
+	}
+	return true
+}
+
+// coolingDown reports whether the registry currently skips the node.
+func coolingDown(registry *nodes.Registry, id string) bool {
+	for _, node := range registry.Pick(nodes.Filter{}, time.Now()) {
+		if node.ID == id {
+			return false
+		}
+	}
+	return true
 }
 
 func eventually(t *testing.T, what string, condition func() bool) {
@@ -233,16 +260,20 @@ func TestSessionParametersCannotChangeWhileActive(t *testing.T) {
 	}
 }
 
-func TestRotatingRequestsCycleThroughWarmTunnels(t *testing.T) {
-	pool, _ := newTestPool(t, testNodes(t, "JP", "US", "KR"), poolOptions{minIdle: 3})
-	eventually(t, "three warm tunnels", func() bool { return len(pool.Status().Tunnels) == 3 })
-	counts := map[string]int{}
-	for i := 0; i < 6; i++ {
-		lease := acquire(t, pool, Request{})
-		counts[lease.NodeID]++
+func TestRotatingConnectionsEachGetAFreshTunnel(t *testing.T) {
+	pool, network := newTestPool(t, testNodes(t, "JP", "JP", "JP"), poolOptions{})
+	if len(pool.Status().Tunnels) != 0 {
+		t.Fatal("tunnels were opened before any request")
 	}
-	if len(counts) != 3 {
-		t.Fatalf("rotation used %v", counts)
+	first := acquire(t, pool, Request{})
+	second := acquire(t, pool, Request{})
+	if first.NodeID == second.NodeID {
+		t.Fatalf("two open rotating connections share %s", first.NodeID)
+	}
+	first.Release()
+	eventually(t, "the released tunnel to close", func() bool { return network.endpoint(first.NodeID).isClosed() })
+	if network.endpoint(second.NodeID).isClosed() {
+		t.Fatal("a tunnel still in use was closed")
 	}
 }
 
@@ -263,10 +294,8 @@ func TestDroppedTunnelMovesSessionAndCoolsNodeDown(t *testing.T) {
 	if second.NodeID == first.NodeID {
 		t.Fatal("session stayed on a dropped node")
 	}
-	for _, candidate := range registry.Pick(nodes.Filter{}, time.Now()) {
-		if candidate.ID == first.NodeID {
-			t.Fatal("dropped node is not cooling down")
-		}
+	if !coolingDown(registry, first.NodeID) {
+		t.Fatal("dropped node is not cooling down")
 	}
 }
 
@@ -281,15 +310,15 @@ func TestRefusingNodeIsSkipped(t *testing.T) {
 	}
 }
 
-func TestIdleTunnelsCloseAndSlotsAreReused(t *testing.T) {
-	pool, network := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{idle: 10 * time.Millisecond})
+func TestTunnelClosesWithItsLastLeaseAndSlotIsReused(t *testing.T) {
+	pool, network := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{})
 	lease, err := pool.Acquire(context.Background(), Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	firstNode, firstDevice := lease.NodeID, lease.Device
 	lease.Release()
-	eventually(t, "the idle tunnel to close and free its slot", func() bool {
+	eventually(t, "the tunnel to close and free its slot", func() bool {
 		pool.mu.Lock()
 		defer pool.mu.Unlock()
 		return network.endpoint(firstNode).isClosed() && !pool.slots[0]
@@ -300,9 +329,32 @@ func TestIdleTunnelsCloseAndSlotsAreReused(t *testing.T) {
 	}
 }
 
+func TestSessionKeepsItsTunnelBetweenConnections(t *testing.T) {
+	pool, network := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{})
+	lease, err := pool.Acquire(context.Background(), Request{Session: "a", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+	if network.endpoint(lease.NodeID).isClosed() {
+		t.Fatal("the session's tunnel closed before its TTL")
+	}
+	if again := acquire(t, pool, Request{Session: "a", TTL: time.Minute}); again.NodeID != lease.NodeID {
+		t.Fatalf("session moved from %s to %s", lease.NodeID, again.NodeID)
+	}
+}
+
+func TestFullPoolSharesALiveTunnel(t *testing.T) {
+	pool, _ := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{maxTunnels: 1})
+	first := acquire(t, pool, Request{})
+	if second := acquire(t, pool, Request{}); second.NodeID != first.NodeID {
+		t.Fatalf("with one slot the second connection should share %s, got %s", first.NodeID, second.NodeID)
+	}
+}
+
 func TestPoolCloseClosesTunnels(t *testing.T) {
 	pool, network := newTestPool(t, testNodes(t, "JP"), poolOptions{})
-	lease, err := pool.Acquire(context.Background(), Request{})
+	lease, err := pool.Acquire(context.Background(), Request{Session: "a", TTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,60 +399,5 @@ func TestConcurrentSessions(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
-	}
-}
-
-// sharedEgress makes 10.0.0.1 and 10.0.0.2 leave through one NAT address,
-// like VPNGate's academic servers do, while 10.0.0.3 has its own.
-var sharedEgress = map[string]string{
-	"10.0.0.1": "198.51.100.1", "10.0.0.2": "198.51.100.1", "10.0.0.3": "198.51.100.3",
-}
-
-func TestExpiredSessionAvoidsSharedEgress(t *testing.T) {
-	pool, _ := newTestPool(t, testNodes(t, "JP", "JP", "JP"), poolOptions{egress: sharedEgress})
-	first := acquire(t, pool, Request{Session: "a", TTL: 50 * time.Millisecond})
-	time.Sleep(80 * time.Millisecond)
-	second := acquire(t, pool, Request{Session: "a", TTL: 50 * time.Millisecond})
-	if first.Egress != "198.51.100.1" || second.Egress != "198.51.100.3" {
-		t.Fatalf("rotation went from %s (%s) to %s (%s); another node behind the same NAT is not a new IP",
-			first.NodeID, first.Egress, second.NodeID, second.Egress)
-	}
-}
-
-func TestSessionsSpreadAcrossEgress(t *testing.T) {
-	pool, _ := newTestPool(t, testNodes(t, "JP", "JP", "JP"), poolOptions{egress: sharedEgress})
-	x := acquire(t, pool, Request{Session: "x", TTL: time.Minute})
-	y := acquire(t, pool, Request{Session: "y", TTL: time.Minute})
-	if x.Egress == y.Egress {
-		t.Fatalf("sessions share %s although another IP exists", x.Egress)
-	}
-}
-
-func TestRotationCyclesEgressIPs(t *testing.T) {
-	pool, _ := newTestPool(t, testNodes(t, "JP", "JP", "JP"), poolOptions{minIdle: 3, egress: sharedEgress})
-	eventually(t, "three warm tunnels", func() bool { return len(pool.Status().Tunnels) == 3 })
-	counts := map[string]int{}
-	for i := 0; i < 4; i++ {
-		counts[acquire(t, pool, Request{}).Egress]++
-	}
-	if counts["198.51.100.1"] != 2 || counts["198.51.100.3"] != 2 {
-		t.Fatalf("rotation should alternate between the two IPs, got %v", counts)
-	}
-}
-
-func TestTunnelWithoutTrafficIsDropped(t *testing.T) {
-	registry := testNodes(t, "JP", "JP")
-	// 10.0.0.1 connects but its egress probe fails, as a dead node would.
-	pool, network := newTestPool(t, registry, poolOptions{egress: map[string]string{"10.0.0.2": "198.51.100.2"}})
-	if lease := acquire(t, pool, Request{Session: "a", TTL: time.Minute}); lease.NodeID != "10.0.0.2" {
-		t.Fatalf("expected the node that carries traffic, got %s", lease.NodeID)
-	}
-	if !network.endpoint("10.0.0.1").isClosed() {
-		t.Fatal("the silent tunnel was left open")
-	}
-	for _, candidate := range registry.Pick(nodes.Filter{}, time.Now()) {
-		if candidate.ID == "10.0.0.1" {
-			t.Fatal("the silent node is not cooling down")
-		}
 	}
 }

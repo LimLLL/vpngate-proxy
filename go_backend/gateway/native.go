@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +35,11 @@ type NativeTunnel struct {
 	device  string
 	cleanup func() error
 	routed  atomic.Bool
+
+	failure chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	lost    error
 }
 
 // ConnectNative connects node on device and routes traffic from sockets bound
@@ -44,9 +50,21 @@ func ConnectNative(ctx context.Context, node nodes.Candidate, device string, slo
 	if err != nil {
 		return nil, err
 	}
+	tunnel := &NativeTunnel{client: client, device: device, failure: make(chan struct{})}
+	var connected atomic.Bool
 	client.OnEvent = func(event core.Event) {
 		if event.Fatal || event.Error {
 			log.Printf("%s %s: %s", device, event.Name, event.Info)
+		}
+		if event.Name == "CONNECTED" {
+			connected.Store(true)
+			return
+		}
+		// After a lost connection Core reconnects on its own, keeping the
+		// TUN up while traffic is dropped, possibly to come back on another
+		// VPN address; callers are better served by another tunnel.
+		if connected.Load() && (event.Name == "RECONNECTING" || event.Error || event.Fatal) {
+			tunnel.fail(fmt.Errorf("OpenVPN 3 %s after connecting: %s", event.Name, event.Info))
 		}
 	}
 	info, err := client.Connect(ctx)
@@ -58,20 +76,42 @@ func ConnectNative(ctx context.Context, node nodes.Candidate, device string, slo
 		closeClient(client)
 		return nil, fmt.Errorf("expected %s, Core opened %q", device, info.TUNName)
 	}
-	cleanup, err := InstallRoute(device, slot)
-	if err != nil {
+	if tunnel.cleanup, err = InstallRoute(device, slot); err != nil {
 		closeClient(client)
 		return nil, err
 	}
-	tunnel := &NativeTunnel{client: client, device: device, cleanup: cleanup}
 	tunnel.routed.Store(true)
+	go func() {
+		<-client.Failure()
+		tunnel.fail(nil)
+	}()
 	return tunnel, nil
 }
 
 func (n *NativeTunnel) Device() string                     { return n.device }
 func (n *NativeTunnel) Info() (core.ConnectionInfo, error) { return n.client.ConnectionInfo() }
-func (n *NativeTunnel) Failure() <-chan struct{}           { return n.client.Failure() }
-func (n *NativeTunnel) FailureError() error                { return n.client.FailureError() }
+
+// Failure closes when Core stops, planned or not, or reconnects.
+func (n *NativeTunnel) Failure() <-chan struct{} { return n.failure }
+
+func (n *NativeTunnel) FailureError() error {
+	if err := n.client.FailureError(); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lost
+}
+
+// fail closes Failure; reason is nil when Core itself stopped.
+func (n *NativeTunnel) fail(reason error) {
+	n.mu.Lock()
+	if n.lost == nil {
+		n.lost = reason
+	}
+	n.mu.Unlock()
+	n.once.Do(func() { close(n.failure) })
+}
 
 func (n *NativeTunnel) Close(ctx context.Context) error {
 	clientErr := n.client.Close(ctx)

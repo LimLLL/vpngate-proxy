@@ -15,7 +15,8 @@ import (
 	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
-// Config is data-dir/config.json. Missing fields take the defaults below;
+// Config is data-dir/config.json. Missing fields take the defaults below and
+// unknown ones, such as the retired min_idle_tunnels, are ignored;
 // LOCAL_PROXY_* environment variables override fields without being saved.
 type Config struct {
 	Username        string   `json:"username"`
@@ -23,7 +24,6 @@ type Config struct {
 	ProxyHost       string   `json:"proxy_host"`
 	ProxyPort       int      `json:"proxy_port"`
 	MaxTunnels      int      `json:"max_tunnels"`
-	MinIdleTunnels  int      `json:"min_idle_tunnels"`
 	TUNBase         int      `json:"tun_base"`
 	NodeMaxAgeDays  int      `json:"node_max_age_days"`
 	NodeMaxFailures int      `json:"node_max_failures"`
@@ -35,8 +35,7 @@ var accountPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 func defaultConfig() Config {
 	return Config{
 		ProxyHost: "127.0.0.1", ProxyPort: 7928,
-		MaxTunnels: 64, MinIdleTunnels: 4,
-		NodeMaxAgeDays: 7, NodeMaxFailures: 5,
+		MaxTunnels: 64, NodeMaxAgeDays: 7, NodeMaxFailures: 5,
 		APIURLs: []string{"https://www.vpngate.net/api/iphone/", "http://www.vpngate.net/api/iphone/"},
 	}
 }
@@ -99,8 +98,6 @@ func (c Config) validate() error {
 		return fmt.Errorf("proxy port %d is invalid", c.ProxyPort)
 	case c.MaxTunnels < 1 || c.MaxTunnels > 1000:
 		return fmt.Errorf("max_tunnels must be 1-1000, got %d", c.MaxTunnels)
-	case c.MinIdleTunnels < 0 || c.MinIdleTunnels > c.MaxTunnels:
-		return fmt.Errorf("min_idle_tunnels must be 0-%d, got %d", c.MaxTunnels, c.MinIdleTunnels)
 	case c.TUNBase < 0:
 		return errors.New("tun_base must not be negative")
 	case c.NodeMaxAgeDays < 1 || c.NodeMaxFailures < 1:

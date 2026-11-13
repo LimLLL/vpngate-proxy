@@ -152,24 +152,53 @@ func (p *Proxy) validCredentials(username, password string) bool {
 	return err == nil
 }
 
-func (p *Proxy) acquireTunnel(ctx context.Context, username, password string) (*Lease, LeaseDialer, error) {
-	request, err := p.authenticate(username, password)
-	if err != nil {
-		return nil, nil, err
-	}
-	lease, err := p.pool.Acquire(ctx, request)
-	if err != nil {
-		return nil, nil, err
-	}
-	if p.DialerForLease != nil {
-		dialer, err := p.DialerForLease(lease)
+// dialBudget bounds connecting a node (several tries when nodes fail), the
+// dial through it and one retry on another tunnel.
+const dialBudget = 90 * time.Second
+
+// dialError is a failure to reach the target through a tunnel that works,
+// answered with 502 rather than 503.
+type dialError struct{ err error }
+
+func (e dialError) Error() string { return e.err.Error() }
+func (e dialError) Unwrap() error { return e.err }
+
+// dial acquires a tunnel for request and connects to host:port through it.
+// When the dial times out, the tunnel is checked; if it no longer carries
+// traffic it is dropped, and the dial is retried once on another tunnel
+// before the client hears of it.
+func (p *Proxy) dial(ctx context.Context, request Request, host string, port int) (*Lease, net.Conn, error) {
+	for retried := false; ; retried = true {
+		lease, err := p.pool.Acquire(ctx, request)
 		if err != nil {
-			lease.Release()
 			return nil, nil, err
 		}
-		return lease, dialer, nil
+		var dialer LeaseDialer = DeviceDialer{Device: lease.Device, DNS: "8.8.8.8"}
+		if p.DialerForLease != nil {
+			if dialer, err = p.DialerForLease(lease); err != nil {
+				lease.Release()
+				return nil, nil, err
+			}
+		}
+		upstream, err := dialer.DialContext(ctx, host, port)
+		if err == nil {
+			lease.ReportSuccess()
+			return lease, upstream, nil
+		}
+		dead := timedOut(err) && ctx.Err() == nil && !lease.Recheck(ctx)
+		lease.Release()
+		if !dead || retried {
+			return nil, nil, dialError{fmt.Errorf("%s: %w", lease.Device, err)}
+		}
+		log.Printf("%s carries no traffic (%v); retrying %s:%d on another tunnel", lease.Device, err, host, port)
 	}
-	return lease, DeviceDialer{Device: lease.Device, DNS: "8.8.8.8"}, nil
+}
+
+// timedOut covers DNS and connect timeouts, which is how a tunnel that
+// silently stopped forwarding shows itself.
+func timedOut(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout() || errors.Is(err, context.DeadlineExceeded)
 }
 
 // rejected reports whether err is the client's fault (407) rather than a
@@ -194,28 +223,72 @@ func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {
 		p.authenticationError(client, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(p.ctx, 45*time.Second)
+	wanted, err := p.authenticate(user, password)
+	if err != nil {
+		p.authenticationError(client, err)
+		return
+	}
+	connect := request.Method == http.MethodConnect
+	var host string
+	var port int
+	if connect {
+		host, port, err = proxyAuthority(request.Host)
+	} else {
+		host, port, err = forwardTarget(request)
+	}
+	if errors.Is(err, errNotHTTP) {
+		writeHTTP(client, http.StatusNotImplemented)
+		return
+	}
+	if err != nil {
+		writeHTTP(client, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, dialBudget)
 	defer cancel()
-	lease, egress, err := p.acquireTunnel(ctx, user, password)
+	// Connecting a node can outlast the deadline for reading the request.
+	_ = client.SetDeadline(time.Time{})
+	lease, upstream, err := p.dial(ctx, wanted, host, port)
 	if rejected(err) {
 		p.authenticationError(client, err)
 		return
 	}
 	if err != nil {
-		log.Printf("no tunnel for %q: %v", user, err)
-		writeHTTP(client, http.StatusServiceUnavailable)
+		log.Printf("%s %s:%d: %v", user, host, port, err)
+		if errors.As(err, new(dialError)) {
+			writeHTTP(client, http.StatusBadGateway)
+		} else {
+			writeHTTP(client, http.StatusServiceUnavailable)
+		}
 		return
 	}
 	defer lease.Release()
-	if request.Method == http.MethodConnect {
-		host, port, err := proxyAuthority(request.Host)
-		if err != nil {
-			writeHTTP(client, http.StatusBadRequest)
+	defer upstream.Close()
+	if connect {
+		if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 			return
 		}
-		p.connectHTTP(ctx, readerConn{Reader: reader, Conn: client}, egress, host, port)
+		relay(p.ctx, readerConn{Reader: reader, Conn: client}, upstream)
 		return
 	}
+	// The request was parsed from its header alone; the body, if any, is
+	// still in reader.
+	if request.ContentLength > 0 {
+		request.Body = io.NopCloser(io.LimitReader(reader, request.ContentLength))
+	} else if len(request.TransferEncoding) > 0 && request.TransferEncoding[0] == "chunked" {
+		request.Body = io.NopCloser(httputil.NewChunkedReader(reader))
+	}
+	if err := request.Write(upstream); err != nil {
+		return
+	}
+	relay(p.ctx, client, upstream)
+}
+
+var errNotHTTP = errors.New("only http:// targets can be forwarded without CONNECT")
+
+// forwardTarget finds where a plain HTTP proxy request goes and rewrites it
+// for the origin server.
+func forwardTarget(request *http.Request) (string, int, error) {
 	target := request.URL
 	if target.Hostname() == "" {
 		authority := request.Host
@@ -224,65 +297,26 @@ func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {
 		}
 		parsed, err := url.Parse("http://" + authority)
 		if err != nil {
-			writeHTTP(client, http.StatusBadRequest)
-			return
+			return "", 0, err
 		}
 		target = parsed
 	}
 	if target.Scheme != "http" {
-		writeHTTP(client, http.StatusNotImplemented)
-		return
+		return "", 0, errNotHTTP
 	}
-	port, err := strconv.Atoi(target.Port())
-	if target.Port() == "" {
-		port = 80
+	port := 80
+	if text := target.Port(); text != "" {
+		var err error
+		if port, err = strconv.Atoi(text); err != nil || port < 1 || port > 65535 {
+			return "", 0, fmt.Errorf("invalid port %q", text)
+		}
 	}
-	if err != nil || port < 1 || port > 65535 {
-		writeHTTP(client, http.StatusBadRequest)
-		return
-	}
-	request.URL.Path = target.Path
-	if request.URL.Path == "" {
-		request.URL.Path = "/"
-	}
-	request.URL.RawQuery = target.RawQuery
 	request.URL.Host = target.Host
 	request.RequestURI = ""
 	request.Header.Del("Proxy-Authorization")
 	request.Header.Del("Proxy-Connection")
 	request.Header.Set("Connection", "close")
-	// Original buffers may already contain body bytes; connect parsing above
-	// only used a header-specific reader, so retain those bytes for forwarding.
-	if request.ContentLength > 0 {
-		request.Body = io.NopCloser(io.LimitReader(reader, request.ContentLength))
-	} else if len(request.TransferEncoding) > 0 && request.TransferEncoding[0] == "chunked" {
-		request.Body = io.NopCloser(httputil.NewChunkedReader(reader))
-	}
-	upstream, err := egress.DialContext(ctx, target.Hostname(), port)
-	if err != nil {
-		log.Printf("%s HTTP %s: %v", lease.Device, target.Host, err)
-		writeHTTP(client, http.StatusBadGateway)
-		return
-	}
-	defer upstream.Close()
-	if err := request.Write(upstream); err != nil {
-		return
-	}
-	relay(p.ctx, client, upstream)
-}
-
-func (p *Proxy) connectHTTP(ctx context.Context, client net.Conn, egress LeaseDialer, host string, port int) {
-	upstream, err := egress.DialContext(ctx, host, port)
-	if err != nil {
-		log.Printf("CONNECT host=%s port=%d: %v", host, port, err)
-		writeHTTP(client, http.StatusBadGateway)
-		return
-	}
-	defer upstream.Close()
-	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		return
-	}
-	relay(p.ctx, client, upstream)
+	return target.Hostname(), port, nil
 }
 
 func (p *Proxy) authenticationError(client net.Conn, err error) {

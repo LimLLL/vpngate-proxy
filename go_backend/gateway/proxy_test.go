@@ -213,6 +213,69 @@ func TestHTTPStatusSeparatesRejectionFromShortage(t *testing.T) {
 	}
 }
 
+// timeoutDialer fails the way a dial through a tunnel that stopped forwarding does.
+type timeoutDialer struct{}
+
+func (timeoutDialer) DialContext(context.Context, string, int) (net.Conn, error) {
+	return nil, &net.DNSError{Err: "i/o timeout", Name: "example.com", Server: "8.8.8.8:53", IsTimeout: true}
+}
+func (timeoutDialer) ResolveIPv4(context.Context, string) ([]net.IP, error) {
+	return nil, errors.New("not used")
+}
+
+func TestTimedOutDialMovesToAnotherTunnel(t *testing.T) {
+	pool, network := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{egress: distinctEgress})
+	proxy, err := NewProxy(context.Background(), pool, "acct", "secret", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+	proxy.DialerForLease = func(lease *Lease) (LeaseDialer, error) {
+		if lease.NodeID == "10.0.0.1" {
+			network.kill(lease.NodeID)
+			return timeoutDialer{}, nil
+		}
+		return &recordedDialer{received: make(chan []byte, 1), respondImmediately: true}, nil
+	}
+	request := "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: " + proxyAuth("acct-session-s") + "\r\n\r\n"
+	if status := httpStatus(t, proxy, request); status != http.StatusOK {
+		t.Fatalf("the request should have been retried on a working tunnel, got %d", status)
+	}
+	eventually(t, "the dead tunnel to close", func() bool { return network.endpoint("10.0.0.1").isClosed() })
+}
+
+func TestTimedOutDialThroughAWorkingTunnelIsABadGateway(t *testing.T) {
+	pool, network := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{egress: distinctEgress})
+	proxy, err := NewProxy(context.Background(), pool, "acct", "secret", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+	proxy.DialerForLease = func(*Lease) (LeaseDialer, error) { return timeoutDialer{}, nil }
+	request := "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: " + proxyAuth("acct-session-s") + "\r\n\r\n"
+	if status := httpStatus(t, proxy, request); status != http.StatusBadGateway {
+		t.Fatalf("an unreachable target behind a working tunnel: want 502, got %d", status)
+	}
+	if network.endpoint("10.0.0.1").isClosed() {
+		t.Fatal("a working tunnel was dropped")
+	}
+}
+
+func TestForwardTargetDefaultsToPort80AndKeepsThePath(t *testing.T) {
+	request, err := http.ReadRequest(bufio.NewReader(strings.NewReader(
+		"GET http://example.com/path?q=1 HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port, err := forwardTarget(request)
+	if err != nil || host != "example.com" || port != 80 {
+		t.Fatalf("target %s:%d %v", host, port, err)
+	}
+	if uri := request.URL.RequestURI(); uri != "/path?q=1" || request.Header.Get("Proxy-Connection") != "" {
+		t.Fatalf("forwarded as %q with headers %v", uri, request.Header)
+	}
+}
+
 func TestSOCKS5InvalidCredentials(t *testing.T) {
 	pool, _ := newTestPool(t, testNodes(t, "JP"), poolOptions{})
 	proxy, err := NewProxy(context.Background(), pool, "acct", "secret", 8)

@@ -12,7 +12,7 @@ mkdir -p "${work}/data"
 # tun_base keeps clear of the tun0 used by the earlier probe steps.
 cat > "${work}/data/config.json" <<CONFIG
 {"username": "${user}", "password": "${password}", "proxy_host": "127.0.0.1",
- "proxy_port": ${port}, "tun_base": 100, "min_idle_tunnels": 4}
+ "proxy_port": ${port}, "tun_base": 100}
 CONFIG
 
 "${binary}" --data-dir "${work}/data" > "${work}/proxy.log" 2>&1 &
@@ -36,8 +36,9 @@ summary() {
 }
 
 # egress <username> prints the public IP seen through the proxy, or nothing.
+# Each request may connect a node first, trying another when one fails.
 egress() {
-  curl --silent --max-time 50 --proxy "http://$1:${password}@127.0.0.1:${port}" \
+  curl --silent --max-time 100 --proxy "http://$1:${password}@127.0.0.1:${port}" \
     https://api.ipify.org 2>/dev/null || true
 }
 
@@ -77,7 +78,7 @@ check() {
 }
 
 rotating=()
-for _ in 1 2 3 4; do
+for _ in 1 2 3 4 5; do
   ip=$(check "${user}")
   rotating+=("${ip}")
 done
@@ -96,5 +97,6 @@ rotated=$(check "${user}-session-s1-t-1")
 
 distinct=$(printf '%s\n' "${rotating[@]}" | sort -u | wc -l)
 summary "" "- Rotating requests used ${distinct} distinct IPs out of ${#rotating[@]}."
+(( distinct >= 2 )) || fail "rotating requests all left through ${rotating[0]}"
 summary "- \`country-jp\` egress ${japan} geolocates to \`${japan_code:-unknown}\` (ip-api; informational)."
 summary "- Sticky, distinct-session and TTL rotation checks passed."

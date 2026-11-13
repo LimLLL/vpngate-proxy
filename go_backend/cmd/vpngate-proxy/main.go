@@ -70,8 +70,6 @@ func run(dataDir string, printOnly bool) error {
 		Nodes:           registry,
 		Connect:         gateway.NativeConnector(config.TUNBase, connectTimeout),
 		MaxTunnels:      config.MaxTunnels,
-		MinIdle:         config.MinIdleTunnels,
-		IdleTimeout:     10 * time.Minute,
 		ConnectTimeout:  connectTimeout,
 		ConnectAttempts: 3,
 		Egress:          probeEgress,

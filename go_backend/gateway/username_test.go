@@ -11,7 +11,7 @@ func TestParseUsername(t *testing.T) {
 		want     Request
 	}{
 		{"acct", Request{}},
-		{"acct-session-abc", Request{Session: "abc", TTL: DefaultSessionTTL}},
+		{"acct-session-abc", Request{Session: "abc", TTL: 10 * time.Minute}},
 		{"acct-session-abc-t-10", Request{Session: "abc", TTL: 10 * time.Minute}},
 		{"acct-country-jp", Request{Country: "JP"}},
 		{"acct-country-JP-session-a_1-t-1440", Request{Country: "JP", Session: "a_1", TTL: 24 * time.Hour}},

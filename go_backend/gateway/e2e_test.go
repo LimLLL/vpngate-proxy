@@ -44,8 +44,7 @@ func TestControlledSessionGateway(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool, err := NewPool(ctx, PoolConfig{
-		Nodes: registry, Connect: NativeConnector(0, 20*time.Second),
-		MaxTunnels: 8, MinIdle: 2, IdleTimeout: 10 * time.Minute,
+		Nodes: registry, Connect: NativeConnector(0, 20*time.Second), MaxTunnels: 8,
 		ConnectTimeout: 20 * time.Second, ConnectAttempts: 3, Logf: t.Logf,
 	})
 	if err != nil {
@@ -88,11 +87,13 @@ func TestControlledSessionGateway(t *testing.T) {
 		}
 		return host
 	}
-	device := func(session string) string {
+	// node names the node a session's live tunnel goes through. Devices are
+	// not compared: tunnels close when unused, so TUN slots are reused.
+	node := func(session string) string {
 		t.Helper()
 		for _, status := range pool.Status().Sessions {
-			if status.ID == session {
-				return status.Device
+			if status.ID == session && status.Device != "" {
+				return status.Node
 			}
 		}
 		return ""
@@ -103,18 +104,18 @@ func TestControlledSessionGateway(t *testing.T) {
 	if first != second {
 		t.Fatalf("session changed before expiration: %q %q", first, second)
 	}
-	firstDevice := device("alpha")
-	if firstDevice == "" {
+	firstNode := node("alpha")
+	if firstNode == "" {
 		t.Fatal("alpha has no native TUN")
 	}
 	independentIP := request("test-session-beta-t-1")
-	if independentIP == first || device("beta") == firstDevice {
+	if independentIP == first || node("beta") == firstNode {
 		t.Fatalf("session beta did not receive an independent TUN: %s", independentIP)
 	}
 	_ = request("test-session-holding-t-1")
-	holdDevice := device("holding")
-	if holdDevice == "" || holdDevice == firstDevice {
-		t.Fatalf("holding stream has no independent endpoint: %s", holdDevice)
+	holdNode := node("holding")
+	if holdNode == "" || holdNode == firstNode {
+		t.Fatalf("holding stream has no independent endpoint: %s", holdNode)
 	}
 	stream, reader := openHoldingCONNECT(t, listener.Addr().String())
 	defer stream.Close()
@@ -133,9 +134,9 @@ func TestControlledSessionGateway(t *testing.T) {
 	t.Logf("wait 62 seconds for a complete one-minute session TTL while a CONNECT remains active")
 	time.Sleep(62 * time.Second)
 	rotatedIP := request("test-session-alpha-t-1")
-	rotatedDevice := device("alpha")
-	if rotatedDevice == "" || rotatedDevice == firstDevice {
-		t.Fatalf("TTL did not rotate the native TUN: %s -> %s", firstDevice, rotatedDevice)
+	rotatedNode := node("alpha")
+	if rotatedNode == "" || rotatedNode == firstNode {
+		t.Fatalf("TTL did not move the session to another node: %s -> %s", firstNode, rotatedNode)
 	}
 	if got := writePing(); got != firstEcho {
 		t.Fatalf("the existing TCP upstream was silently reopened during TTL: %q -> %q", firstEcho, got)
@@ -155,9 +156,9 @@ func TestControlledSessionGateway(t *testing.T) {
 	}
 	report := map[string]any{
 		"tunneled_http": true, "sticky_before_ttl": first == second,
-		"fresh_tun_after_ttl":      rotatedDevice != firstDevice,
+		"new_node_after_ttl":       rotatedNode != firstNode,
 		"existing_stream_survives": true,
-		"first_tun":                firstDevice, "rotated_tun": rotatedDevice,
+		"first_node":               firstNode, "rotated_node": rotatedNode,
 		"first_vpn_ip": first, "independent_vpn_ip": independentIP, "rotated_vpn_ip": rotatedIP,
 	}
 	if path := os.Getenv("VPNGATE_SESSION_REPORT"); path != "" {

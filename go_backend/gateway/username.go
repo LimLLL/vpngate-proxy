@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	DefaultSessionTTL = 30 * time.Minute
+	DefaultSessionTTL = 10 * time.Minute
 	maxSessionTTL     = 24 * time.Hour
 )
 

@@ -14,6 +14,9 @@ import (
 // Node is a candidate plus what has been learned about it across listings.
 type Node struct {
 	Candidate
+	// Egress is the public IP last measured through the node; nodes behind
+	// one NAT share it.
+	Egress      string    `json:"egress,omitempty"`
 	FirstSeen   time.Time `json:"first_seen"`
 	LastSeen    time.Time `json:"last_seen"`
 	LastSuccess time.Time `json:"last_success"`
@@ -37,7 +40,7 @@ type RegistryConfig struct {
 // must not call back into the registry.
 type Filter struct {
 	Country string
-	Exclude func(id string) bool
+	Exclude func(Node) bool
 }
 
 // Registry accumulates every node seen in VPNGate listings, because each
@@ -47,14 +50,18 @@ type Registry struct {
 	config RegistryConfig
 	saveMu sync.Mutex
 
-	mu     sync.Mutex
-	nodes  map[string]*Node
-	listed time.Time
+	mu    sync.Mutex
+	nodes map[string]*Node
+	// egressUsed is when each egress IP was last in use, so picks can move
+	// on to the IP that has rested longest.
+	egressUsed map[string]time.Time
+	listed     time.Time
 }
 
 type registryFile struct {
-	ListedAt time.Time `json:"listed_at"`
-	Nodes    []Node    `json:"nodes"`
+	ListedAt   time.Time            `json:"listed_at"`
+	EgressUsed map[string]time.Time `json:"egress_used,omitempty"`
+	Nodes      []Node               `json:"nodes"`
 }
 
 // OpenRegistry loads the table from config.Path when the file exists.
@@ -62,7 +69,7 @@ func OpenRegistry(config RegistryConfig) (*Registry, error) {
 	if config.MaxAge <= 0 || config.MaxFailures < 1 || config.Cooldown < 0 {
 		return nil, errors.New("registry needs a positive max age and failure limit")
 	}
-	r := &Registry{config: config, nodes: make(map[string]*Node)}
+	r := &Registry{config: config, nodes: make(map[string]*Node), egressUsed: make(map[string]time.Time)}
 	if config.Path == "" {
 		return r, nil
 	}
@@ -80,6 +87,9 @@ func OpenRegistry(config RegistryConfig) (*Registry, error) {
 	for i := range file.Nodes {
 		node := file.Nodes[i]
 		r.nodes[node.ID] = &node
+	}
+	for egress, used := range file.EgressUsed {
+		r.egressUsed[egress] = used
 	}
 	r.listed = file.ListedAt
 	return r, nil
@@ -99,43 +109,53 @@ func (r *Registry) Merge(listing []Candidate, now time.Time) (added int, err err
 		added++
 	}
 	r.listed = now
+	known := make(map[string]bool)
 	for id, node := range r.nodes {
 		if now.Sub(node.LastSeen) > r.config.MaxAge {
 			delete(r.nodes, id)
+			continue
+		}
+		known[node.Egress] = true
+	}
+	for egress := range r.egressUsed {
+		if !known[egress] {
+			delete(r.egressUsed, egress)
 		}
 	}
 	r.mu.Unlock()
 	return added, r.Save()
 }
 
-// Pick returns usable candidates, best first: nodes in the latest listing by
-// VPNGate score, then older nodes by how recently they last connected.
-func (r *Registry) Pick(filter Filter, now time.Time) []Candidate {
+// Pick returns usable nodes, best first: the egress IP that has gone unused
+// longest (an unknown egress counts as never used), so consecutive picks move
+// between IPs rather than between nodes behind one NAT; then nodes in the
+// latest listing by VPNGate score; then older nodes by how recently they last
+// connected.
+func (r *Registry) Pick(filter Filter, now time.Time) []Node {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var listed, older []*Node
+	var usable []*Node
 	for _, node := range r.nodes {
-		if filter.Country != "" && node.Country != filter.Country {
+		if filter.Country != "" && node.Country != filter.Country || now.Before(node.RetryAfter) {
 			continue
 		}
-		if now.Before(node.RetryAfter) || filter.Exclude != nil && filter.Exclude(node.ID) {
+		if filter.Exclude != nil && filter.Exclude(*node) {
 			continue
 		}
-		if node.LastSeen.Before(r.listed) {
-			older = append(older, node)
-		} else {
-			listed = append(listed, node)
-		}
+		usable = append(usable, node)
 	}
-	sort.Slice(listed, func(i, j int) bool {
-		a, b := listed[i], listed[j]
-		if a.Score != b.Score {
+	sort.Slice(usable, func(i, j int) bool {
+		a, b := usable[i], usable[j]
+		if usedA, usedB := r.egressUsed[a.Egress], r.egressUsed[b.Egress]; !usedA.Equal(usedB) {
+			return usedA.Before(usedB)
+		}
+		listedA, listedB := !a.LastSeen.Before(r.listed), !b.LastSeen.Before(r.listed)
+		if listedA != listedB {
+			return listedA
+		}
+		if listedA && a.Score != b.Score {
 			return a.Score > b.Score
 		}
-		return a.ID < b.ID
-	})
-	sort.Slice(older, func(i, j int) bool {
-		a, b := older[i], older[j]
 		if !a.LastSuccess.Equal(b.LastSuccess) {
 			return a.LastSuccess.After(b.LastSuccess)
 		}
@@ -144,20 +164,40 @@ func (r *Registry) Pick(filter Filter, now time.Time) []Candidate {
 		}
 		return a.ID < b.ID
 	})
-	result := make([]Candidate, 0, len(listed)+len(older))
-	for _, node := range append(listed, older...) {
-		result = append(result, node.Candidate)
+	result := make([]Node, len(usable))
+	for i, node := range usable {
+		result[i] = *node
 	}
 	return result
 }
 
-func (r *Registry) ReportSuccess(id string, now time.Time) {
+// ReportSuccess records a working connect and the egress IP measured through
+// it, which is in use from now on; egress is empty when it was not measured.
+func (r *Registry) ReportSuccess(id, egress string, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if node, ok := r.nodes[id]; ok {
 		node.LastSuccess = now
 		node.Failures = 0
 		node.RetryAfter = time.Time{}
+		if egress != "" {
+			node.Egress = egress
+		}
+	}
+	r.markUsed(egress, now)
+}
+
+// ReportUsed records that egress was in use until now.
+func (r *Registry) ReportUsed(egress string, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.markUsed(egress, now)
+}
+
+// markUsed must be called with r.mu held.
+func (r *Registry) markUsed(egress string, now time.Time) {
+	if egress != "" {
+		r.egressUsed[egress] = now
 	}
 }
 
@@ -192,9 +232,13 @@ func (r *Registry) Save() error {
 	r.saveMu.Lock()
 	defer r.saveMu.Unlock()
 	r.mu.Lock()
-	file := registryFile{ListedAt: r.listed, Nodes: make([]Node, 0, len(r.nodes))}
+	file := registryFile{ListedAt: r.listed, EgressUsed: make(map[string]time.Time, len(r.egressUsed)),
+		Nodes: make([]Node, 0, len(r.nodes))}
 	for _, node := range r.nodes {
 		file.Nodes = append(file.Nodes, *node)
+	}
+	for egress, used := range r.egressUsed {
+		file.EgressUsed[egress] = used
 	}
 	r.mu.Unlock()
 	sort.Slice(file.Nodes, func(i, j int) bool { return file.Nodes[i].ID < file.Nodes[j].ID })

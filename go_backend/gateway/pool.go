@@ -27,9 +27,10 @@ type Connector func(ctx context.Context, node nodes.Candidate, slot int) (Endpoi
 
 // NodeSource is satisfied by *nodes.Registry.
 type NodeSource interface {
-	Pick(nodes.Filter, time.Time) []nodes.Candidate
-	ReportSuccess(id string, now time.Time)
+	Pick(nodes.Filter, time.Time) []nodes.Node
+	ReportSuccess(id, egress string, now time.Time)
 	ReportFailure(id string, now time.Time)
+	ReportUsed(egress string, now time.Time)
 }
 
 var (
@@ -40,42 +41,57 @@ var (
 	errPoolClosed      = errors.New("pool closed")
 )
 
-// sessionRetention keeps an expired session's last node and egress so the next
-// request with that ID still rotates away from them.
-const sessionRetention = 30 * time.Minute
+const (
+	// sessionRetention keeps an expired session's last node and egress so the
+	// next request with that ID still rotates away from them.
+	sessionRetention = 30 * time.Minute
+	// probeTimeout bounds one egress probe, at connect and in health checks.
+	probeTimeout          = 15 * time.Second
+	defaultHealthInterval = time.Minute
+)
 
 type PoolConfig struct {
 	Nodes   NodeSource
 	Connect Connector
 	// MaxTunnels caps concurrent tunnels and is also the number of TUN slots.
-	MaxTunnels int
-	// MinIdle tunnels without a sticky session are kept warm for new sessions.
-	MinIdle int
-	// IdleTimeout closes unused tunnels beyond the warm reserve.
-	IdleTimeout     time.Duration
-	ConnectTimeout  time.Duration
+	MaxTunnels     int
+	ConnectTimeout time.Duration
+	// ConnectAttempts is how many nodes one request may try before it falls
+	// back to sharing a live tunnel.
 	ConnectAttempts int
-	// Egress reports the public IP seen through a new tunnel. Different nodes
-	// can share one NAT egress, so sessions are spread and rotated by this IP
-	// rather than by node. A failed probe means the tunnel carries no traffic
-	// and it is dropped. With Egress nil every tunnel counts as its own IP.
+	// Egress reports the public IP seen through a tunnel. Different nodes can
+	// share one NAT egress, so sessions are spread and rotated by this IP
+	// rather than by node. It doubles as the health check: a tunnel whose
+	// probe fails carries no traffic and is dropped. With Egress nil every
+	// tunnel counts as its own IP and is never checked.
 	Egress func(ctx context.Context, device string) (string, error)
-	Logf   func(string, ...any)
+	// HealthInterval is how long a session's tunnel may go without a
+	// successful dial before it is probed; zero means one minute.
+	HealthInterval time.Duration
+	Logf           func(string, ...any)
 }
 
-// tunnel is shared by every session and connection routed to its node, since
-// a second tunnel to the same node would not give a different egress IP.
+// tunnel is one OpenVPN connection. Each rotating connection opens its own and
+// each session keeps its own until expiry; a tunnel closes as soon as nothing
+// holds it. A node never has two tunnels at once, because VPNGate servers
+// often refuse a second login from the same client.
 type tunnel struct {
-	node     nodes.Candidate
-	egress   string // public IP behind the node; empty when unknown
-	device   string
-	slot     int
-	endpoint Endpoint
-	leases   int // open proxy connections
-	sessions int // unexpired sticky sessions bound here
-	lastUsed time.Time
-	retired  bool
+	node nodes.Candidate
+	// lastEgress is the egress the node had last time; it stands in for
+	// egress while the tunnel is connecting.
+	lastEgress string
+	egress     string // measured public IP; empty when unknown
+	device     string
+	slot       int
+	endpoint   Endpoint     // nil while connecting
+	leases     int          // open proxy connections plus choosers holding it
+	sessions   int          // unexpired sticky sessions bound here
+	retired    bool         // closing or closed; never handed out again
+	healthy    time.Time    // last successful dial or probe
+	check      *healthCheck // the running health check, if any
 }
+
+func (t *tunnel) live() bool { return t.endpoint != nil && !t.retired }
 
 type session struct {
 	request   Request
@@ -93,16 +109,12 @@ type Pool struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu        sync.Mutex
-	closed    bool
-	tunnels   map[string]*tunnel
-	opening   map[string]bool
-	sessions  map[string]*session
-	slots     []bool
-	changed   chan struct{} // closed and replaced whenever an open finishes
-	next      int
-	warming   bool
-	warmAfter time.Time
+	mu       sync.Mutex
+	closed   bool
+	tunnels  map[string]*tunnel // by node ID, while connecting, live or closing
+	sessions map[string]*session
+	slots    []bool
+	changed  chan struct{} // closed and replaced whenever a tunnel comes up or goes away
 }
 
 // Lease pins one proxy connection to a tunnel until Release.
@@ -122,11 +134,11 @@ func NewPool(parent context.Context, config PoolConfig) (*Pool, error) {
 	if config.Nodes == nil || config.Connect == nil {
 		return nil, errors.New("pool needs a node source and a connector")
 	}
-	if config.MaxTunnels < 1 || config.MinIdle < 0 || config.MinIdle > config.MaxTunnels {
-		return nil, fmt.Errorf("warm reserve %d must fit within %d tunnels", config.MinIdle, config.MaxTunnels)
+	if config.MaxTunnels < 1 || config.ConnectTimeout <= 0 || config.ConnectAttempts < 1 {
+		return nil, errors.New("pool tunnel limit, connect timeout and connect attempts must be positive")
 	}
-	if config.IdleTimeout <= 0 || config.ConnectTimeout <= 0 || config.ConnectAttempts < 1 {
-		return nil, errors.New("pool timeouts and connect attempts must be positive")
+	if config.HealthInterval <= 0 {
+		config.HealthInterval = defaultHealthInterval
 	}
 	if config.Logf == nil {
 		config.Logf = log.Printf
@@ -134,9 +146,8 @@ func NewPool(parent context.Context, config PoolConfig) (*Pool, error) {
 	ctx, cancel := context.WithCancel(parent)
 	p := &Pool{
 		config: config, ctx: ctx, cancel: cancel,
-		tunnels: make(map[string]*tunnel), opening: make(map[string]bool),
-		sessions: make(map[string]*session), slots: make([]bool, config.MaxTunnels),
-		changed: make(chan struct{}),
+		tunnels: make(map[string]*tunnel), sessions: make(map[string]*session),
+		slots: make([]bool, config.MaxTunnels), changed: make(chan struct{}),
 	}
 	p.wg.Add(1)
 	go p.maintain()
@@ -150,6 +161,8 @@ func (p *Pool) Acquire(ctx context.Context, request Request) (*Lease, error) {
 		if err != nil {
 			return nil, err
 		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
 		return p.lease(request, t), nil
 	}
 	for {
@@ -178,9 +191,9 @@ func (p *Pool) Acquire(ctx context.Context, request Request) (*Lease, error) {
 			}
 			if t := s.tunnel; t != nil && !t.retired {
 				t.leases++
-				t.lastUsed = now
+				lease := p.lease(request, t)
 				p.mu.Unlock()
-				return p.lease(request, t), nil
+				return lease, nil
 			}
 		}
 		if s == nil {
@@ -209,173 +222,51 @@ func (p *Pool) Acquire(ctx context.Context, request Request) (*Lease, error) {
 		}
 		s.tunnel, s.last = t, avoid{node: t.node.ID, egress: t.egress}
 		s.expires = time.Now().Add(request.TTL)
+		lease := p.lease(request, t)
 		p.mu.Unlock()
-		return p.lease(request, t), nil
+		return lease, nil
 	}
 }
 
-// avoid names the node and egress a rotating session must move away from.
-type avoid struct{ node, egress string }
-
-func (a avoid) blocks(t *tunnel) bool {
-	return t.node.ID == a.node || a.egress != "" && t.egress == a.egress
-}
-
-// choose returns a tunnel with a lease, and for sticky requests the session,
-// already counted under the same lock that picked it, so concurrent new
-// sessions cannot both claim the same free IP. Sticky sessions prefer an
-// egress no other session uses, then a new node, and share only as a last
-// resort; rotating connections take egress IPs in turn. While other opens are
-// in flight it waits for them rather than failing, which matters for the
-// burst of requests right after startup.
-func (p *Pool) choose(ctx context.Context, country string, away avoid, sticky bool) (*tunnel, error) {
-	for {
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return nil, errPoolClosed
-		}
-		if t := p.pickLive(country, away, sticky, false); t != nil {
-			p.mu.Unlock()
-			return t, nil
-		}
-		p.mu.Unlock()
-		t, openErr := p.open(ctx, country, away, sticky)
-		if t != nil {
-			return t, nil
-		}
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return nil, errPoolClosed
-		}
-		if t := p.pickLive(country, away, sticky, true); t != nil {
-			p.mu.Unlock()
-			return t, nil
-		}
-		if away != (avoid{}) {
-			if t := p.pickLive(country, avoid{}, sticky, true); t != nil {
-				p.config.Logf("no other IP for country %q; session stays on %s", country, t.egress)
-				p.mu.Unlock()
-				return t, nil
-			}
-		}
-		if len(p.opening) == 0 {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("%w for country %q: %v", ErrUnavailable, country, openErr)
-		}
-		wait := p.changed
-		p.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("%w for country %q: %v", ErrUnavailable, country, ctx.Err())
-		case <-wait:
-		}
-	}
-}
-
-// notify must be called with p.mu held.
-func (p *Pool) notify() {
-	close(p.changed)
-	p.changed = make(chan struct{})
-}
-
-// pickLive must be called with p.mu held; it takes the result like choose.
-// Without share, a sticky request only accepts an egress no session uses.
-func (p *Pool) pickLive(country string, away avoid, sticky, share bool) *tunnel {
-	var live []*tunnel
-	for _, t := range p.tunnels {
-		if matches(t, country) && !away.blocks(t) && (!sticky || share || p.egressLoad(t) == 0) {
-			live = append(live, t)
-		}
-	}
-	if len(live) == 0 {
-		return nil
-	}
-	sort.Slice(live, func(i, j int) bool {
-		a, b := live[i], live[j]
-		if loadA, loadB := p.egressLoad(a), p.egressLoad(b); sticky && loadA != loadB {
-			return loadA < loadB
-		}
-		if a.leases != b.leases {
-			return a.leases < b.leases
-		}
-		return a.node.ID < b.node.ID
-	})
-	t := live[0]
-	if !sticky {
-		// Rotate over distinct egress IPs, taking the least busy tunnel of
-		// each, so consecutive requests change IP even behind shared NAT.
-		var groups []*tunnel
-		seen := make(map[string]bool)
-		for _, candidate := range live {
-			key := egressKey(candidate)
-			if !seen[key] {
-				seen[key] = true
-				groups = append(groups, candidate)
-			}
-		}
-		sort.Slice(groups, func(i, j int) bool { return egressKey(groups[i]) < egressKey(groups[j]) })
-		t = groups[p.next%len(groups)]
-		p.next++
-	}
-	p.take(t, sticky)
-	return t
-}
-
-// egressLoad counts sticky sessions on every live tunnel sharing t's egress.
-func (p *Pool) egressLoad(t *tunnel) int {
-	if t.egress == "" {
-		return t.sessions
-	}
-	load := 0
-	for _, other := range p.tunnels {
-		if other.egress == t.egress {
-			load += other.sessions
-		}
-	}
-	return load
-}
-
-// egressKey groups tunnels by IP; an unknown egress is its own group.
-func egressKey(t *tunnel) string {
-	if t.egress == "" {
-		return "node:" + t.node.ID
-	}
-	return t.egress
-}
-
-func (p *Pool) take(t *tunnel, sticky bool) {
-	t.leases++
-	if sticky {
-		t.sessions++
-	}
-	t.lastUsed = time.Now()
-}
-
-func matches(t *tunnel, country string) bool {
-	return !t.retired && (country == "" || t.node.Country == country)
-}
-
+// unbind must be called with p.mu held.
 func (p *Pool) unbind(s *session) {
-	if s.tunnel != nil {
-		s.tunnel.sessions--
+	if t := s.tunnel; t != nil {
+		t.sessions--
 		s.tunnel = nil
+		p.closeIfIdle(t)
 	}
 }
 
+// lease must be called with p.mu held, on a tunnel whose lease is counted.
 func (p *Pool) lease(request Request, t *tunnel) *Lease {
 	return &Lease{Request: request, Device: t.device, NodeID: t.node.ID,
 		Country: t.node.Country, Egress: t.egress, pool: p, tunnel: t}
 }
 
+// Release ends the connection's hold on the tunnel, which closes once
+// nothing else holds it.
 func (l *Lease) Release() {
 	l.once.Do(func() {
 		l.pool.mu.Lock()
 		l.tunnel.leases--
-		l.tunnel.lastUsed = time.Now()
+		l.pool.closeIfIdle(l.tunnel)
 		l.pool.mu.Unlock()
 	})
+}
+
+// ReportSuccess records a successful dial through the lease's tunnel, which
+// postpones its next health check.
+func (l *Lease) ReportSuccess() {
+	l.pool.mu.Lock()
+	l.tunnel.healthy = time.Now()
+	l.pool.mu.Unlock()
+}
+
+// Recheck probes the lease's tunnel after a dial through it timed out. A
+// tunnel that no longer carries traffic is dropped and its node cooled down;
+// Recheck then returns false, and a new Acquire gets another tunnel.
+func (l *Lease) Recheck(ctx context.Context) bool {
+	return l.pool.check(ctx, l.tunnel)
 }
 
 type TunnelStatus struct {
@@ -404,6 +295,9 @@ func (p *Pool) Status() PoolStatus {
 	defer p.mu.Unlock()
 	var status PoolStatus
 	for _, t := range p.tunnels {
+		if !t.live() {
+			continue
+		}
 		status.Tunnels = append(status.Tunnels, TunnelStatus{Node: t.node.ID, Egress: t.egress, Country: t.node.Country,
 			Device: t.device, Sessions: t.sessions, Leases: t.leases})
 	}
@@ -429,10 +323,13 @@ func (p *Pool) Close() error {
 	}
 	p.closed = true
 	p.cancel()
+	p.notify()
 	var all []*tunnel
 	for _, t := range p.tunnels {
-		p.retire(t)
-		all = append(all, t)
+		if t.live() {
+			p.retire(t)
+			all = append(all, t)
+		}
 	}
 	p.mu.Unlock()
 	errs := make(chan error, len(all))
