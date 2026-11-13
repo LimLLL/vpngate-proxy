@@ -20,7 +20,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
@@ -116,6 +116,10 @@ jobs:
             --profile "${RUNNER_TEMP}/candidate.ovpn" --stay 5s --url "https://api.ipify.org" \
             --connected-file "${RUNNER_TEMP}/go-connected.json" >"${RUNNER_TEMP}/go-probe.log" 2>&1
           cat "${RUNNER_TEMP}/go-probe.log"
+
+      - name: Verify the proxy against public VPNGate nodes
+        if: inputs.live
+        run: sudo --preserve-env=RUNNER_TEMP,GITHUB_STEP_SUMMARY bash scripts/live_proxy_check.sh "${RUNNER_TEMP}/vpngate-proxy"
 
       - name: Publish actual public VPNGate verification
         if: inputs.live && steps.live_validation.conclusion == 'success'
