@@ -22,18 +22,25 @@ func main() {
 	source := flag.String("source", "https://www.vpngate.net/api/iphone/", "VPNGate CSV endpoint")
 	fixture := flag.String("fixture", "", "use a prepared CSV rather than downloading")
 	fallback := flag.String("fallback", "nodes/testdata/vpngate.csv", "offline snapshot if the official endpoint fails")
-	output := flag.String("output", "candidate.ovpn", "validated native profile path")
+	outputDir := flag.String("output-dir", "candidates", "directory for the validated native profiles, 01.ovpn first")
+	count := flag.Int("count", 5, "number of profiles, each from a different /24 network")
 	snapshotOutput := flag.String("snapshot-output", "", "optional exact source CSV retention path")
 	device := flag.String("device", "tun0", "fixed client TUN interface")
 	flag.Parse()
-	if err := prepare(*source, *fixture, *fallback, *output, *snapshotOutput, *device); err != nil {
+	if err := prepare(*source, *fixture, *fallback, *outputDir, *snapshotOutput, *device, *count); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func prepare(sourceURL, fixture, fallback, output, snapshotOutput, device string) error {
+// prepare writes the best scored candidates, at most one per /24 network so
+// that a busy cluster such as VPNGate's academic servers cannot take every
+// slot, for the probe to try in order.
+func prepare(sourceURL, fixture, fallback, outputDir, snapshotOutput, device string, count int) error {
 	if !regexp.MustCompile(`^tun[0-9]*$`).MatchString(device) {
 		return errors.New("client device must be tun or tunN")
+	}
+	if count < 1 {
+		return errors.New("count must be positive")
 	}
 	var data []byte
 	var err error
@@ -53,24 +60,32 @@ func prepare(sourceURL, fixture, fallback, output, snapshotOutput, device string
 	if err != nil {
 		return err
 	}
-	// Highest VPNGate score first, the same preference the registry uses.
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Score > candidates[j].Score })
-	candidate := candidates[0]
-	if err := os.MkdirAll(filepath.Dir(output), 0o700); err != nil {
+	if err := os.MkdirAll(outputDir, 0o700); err != nil {
 		return err
 	}
-	profile := nodes.PrepareProfile(candidate.Profile, device)
-	if err := os.WriteFile(output, []byte(profile), 0o600); err != nil {
-		return err
+	var written []map[string]any
+	taken := make(map[string]bool)
+	for _, candidate := range candidates {
+		if len(written) == count {
+			break
+		}
+		if network := nodes.Network(candidate.IP); !taken[network] {
+			taken[network] = true
+			file := filepath.Join(outputDir, fmt.Sprintf("%02d.ovpn", len(written)+1))
+			profile := nodes.PrepareProfile(candidate.Profile, device)
+			if err := os.WriteFile(file, []byte(profile), 0o600); err != nil {
+				return err
+			}
+			written = append(written, map[string]any{"candidate": candidate.ID, "score": candidate.Score, "file": file})
+		}
 	}
 	if snapshotOutput != "" {
 		if err := os.WriteFile(snapshotOutput, data, 0o600); err != nil {
 			return err
 		}
 	}
-	metadata := map[string]any{"candidate": candidate.ID, "host": candidate.IP,
-		"file": output, "profile_bytes": len(profile)}
-	formatted, err := json.MarshalIndent(metadata, "", "  ")
+	formatted, err := json.MarshalIndent(written, "", "  ")
 	if err != nil {
 		return err
 	}

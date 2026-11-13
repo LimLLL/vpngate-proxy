@@ -73,15 +73,15 @@ func (r *Registry) before(a, b *Node) bool {
 // volunteer nodes and in the same /24 as the egress of the academic ones.
 func (n *Node) network() string {
 	if n.Egress != "" {
-		return network(n.Egress)
+		return Network(n.Egress)
 	}
-	return network(n.IP)
+	return Network(n.IP)
 }
 
-// network names the /24 holding an IPv4 address: sites and blocklists
+// Network names the /24 holding an IPv4 address: sites and blocklists
 // commonly treat a /24 as one source, and NAT gateways hand out egress
 // addresses from one. Anything else is its own network.
-func network(ip string) string {
+func Network(ip string) string {
 	v4 := net.ParseIP(ip).To4()
 	if v4 == nil {
 		return ip
@@ -103,7 +103,7 @@ func newUsage() usage {
 func (u usage) markIP(ip string, now time.Time) {
 	if ip != "" {
 		u.IPs[ip] = now
-		u.Networks[network(ip)] = now
+		u.Networks[Network(ip)] = now
 	}
 }
 
@@ -122,7 +122,7 @@ func (u usage) prune(nodes map[string]*Node) {
 	ips := make(map[string]bool)
 	for _, node := range nodes {
 		networks[node.network()] = true
-		networks[network(node.IP)] = true
+		networks[Network(node.IP)] = true
 		ips[node.Egress] = true
 	}
 	for key := range u.Networks {

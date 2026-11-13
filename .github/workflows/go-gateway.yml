@@ -37,6 +37,7 @@ jobs:
         with:
           core-commit: ${{ env.OPENVPN3_COMMIT }}
       - name: Build, vet and test the complete Go gateway
+        id: gateway_build
         env:
           CGO_ENABLED: "1"
           CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
@@ -76,7 +77,7 @@ jobs:
           sudo modprobe tun
           test -c /dev/net/tun
           go build -race -o "${RUNNER_TEMP}/vpngate-prepare" ./cmd/candidate
-          "${RUNNER_TEMP}/vpngate-prepare" --output "${RUNNER_TEMP}/candidate.ovpn" \
+          "${RUNNER_TEMP}/vpngate-prepare" --output-dir "${RUNNER_TEMP}/candidates" --count 5 \
             --snapshot-output "${RUNNER_TEMP}/vpngate-live.csv" --device tun0 \
             --fallback "${GITHUB_WORKSPACE}/go_backend/nodes/testdata/vpngate.csv"
 
@@ -84,7 +85,7 @@ jobs:
         if: inputs.live
         working-directory: go_backend
         env:
-          VPNGATE_TEST_PROFILE: ${{ runner.temp }}/candidate.ovpn
+          VPNGATE_TEST_PROFILE: ${{ runner.temp }}/candidates/01.ovpn
           CGO_LDFLAGS: -L${{ runner.temp }}/go-bridge-build -Wl,-rpath,${{ runner.temp }}/go-bridge-build
         run: go test -race ./core -run 'Test(RealVPNGateProfileEvalAndRelease|FailedNativeConnectionCanBeClosed)$' -v
 
@@ -100,16 +101,20 @@ jobs:
       - name: Verify actual public egress and native stop
         if: inputs.live
         id: live_validation
+        # The probe tries the candidates in order until one carries traffic.
         run: |
-          sudo timeout --signal=TERM --kill-after=5s 70s "${RUNNER_TEMP}/vpngate-go-probe" \
-            --profile "${RUNNER_TEMP}/candidate.ovpn" --stay 5s --url "https://api.ipify.org" \
-            --connected-file "${RUNNER_TEMP}/go-connected.json" >"${RUNNER_TEMP}/go-probe.log" 2>&1
+          rc=0
+          sudo timeout --signal=TERM --kill-after=5s 300s "${RUNNER_TEMP}/vpngate-go-probe" \
+            --profile "${RUNNER_TEMP}/candidates/*.ovpn" --stay 5s --url "https://api.ipify.org" \
+            --connected-file "${RUNNER_TEMP}/go-connected.json" >"${RUNNER_TEMP}/go-probe.log" 2>&1 || rc=$?
           cat "${RUNNER_TEMP}/go-probe.log"
+          [[ ${rc} -eq 0 ]] || exit "${rc}"
           # The probe runs as root and writes 0600; the artifact upload runs as the runner user.
           sudo chmod a+r "${RUNNER_TEMP}/go-connected.json"
 
+      # Independent of the single-tunnel probe above, so one cannot hide the other.
       - name: Verify the proxy against public VPNGate nodes
-        if: inputs.live
+        if: inputs.live && !cancelled() && steps.gateway_build.outcome == 'success'
         run: sudo --preserve-env=RUNNER_TEMP,GITHUB_STEP_SUMMARY bash scripts/live_proxy_check.sh "${RUNNER_TEMP}/vpngate-proxy"
 
       - name: Publish actual public VPNGate verification
