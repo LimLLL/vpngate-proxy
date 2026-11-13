@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/LimLLL/vpngate-proxy/go_backend/gateway"
+	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
 func run() (resultErr error) {
@@ -26,22 +27,15 @@ func run() (resultErr error) {
 	if *profilePath == "" || *stay < 0 {
 		return errors.New("a profile and a nonnegative stay duration are required")
 	}
-	source, err := gateway.FileSource(*profilePath)
+	candidates, err := nodes.LoadProfiles(*profilePath)
 	if err != nil {
 		return err
 	}
-	candidate, err := source.Next(context.Background())
-	if err != nil {
-		return err
-	}
-	factory, err := gateway.NewNativeFactory(gateway.NativeConfig{Source: source, Timeout: 30 * time.Second})
-	if err != nil {
-		return err
-	}
+	candidate := candidates[0]
 	started := time.Now()
 	contextConnect, cancelConnect := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancelConnect()
-	endpoint, err := factory.Connect(contextConnect, candidate)
+	endpoint, err := gateway.ConnectNative(contextConnect, candidate, "tun0", 0, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("connect native tunnel: %w", err)
 	}

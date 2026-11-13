@@ -1,36 +1,49 @@
 # vpngate-proxy
 
-基于 VPNGate 公共节点的 HTTP / SOCKS5 代理网关。Go 负责节点获取、隧道池和代理；OpenVPN 协议、TLS 和 TUN 由嵌入的官方 OpenVPN 3 Core（C++，经 `go_backend/bridge.cpp` 的 C ABI 调用）执行。
+把 VPNGate 公共节点包装成类似商业动态住宅代理的 HTTP / SOCKS5 网关：用户名里带国家和会话参数，控制出口国家与 IP 粘滞时长。Go 负责节点、隧道池和代理；OpenVPN 协议、TLS 和 TUN 由嵌入的官方 OpenVPN 3 Core（C++，经 `go_backend/bridge.cpp` 的 C ABI 调用）执行。需求见 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)。
+
+## 用法
+
+```
+http://<账号>[-country-<国家>][-session-<会话ID>[-t-<分钟>]]:<密码>@<主机>:7928
+socks5://同上
+```
+
+| 用户名 | 行为 |
+| --- | --- |
+| `user` | 每个新连接轮换出口 |
+| `user-session-abc-t-10` | 同一出口 IP 粘滞 10 分钟（默认 30），到期换节点 |
+| `user-country-jp-session-abc` | 日本节点，粘滞 30 分钟 |
+
+## 运行
+
+需要 Linux、root 和 `/dev/net/tun`。
+
+```bash
+vpngate-proxy --data-dir ./vpngate_data --print-credentials  # 首次运行生成 config.json，并打印账号密码
+sudo vpngate-proxy --data-dir ./vpngate_data
+```
+
+数据目录：
+
+- `config.json`：账号、密码、监听地址、隧道数量（`max_tunnels`，默认 64）、预热隧道数（`min_idle_tunnels`，默认 4）、节点淘汰阈值（`node_max_age_days` 7、`node_max_failures` 5）、VPNGate API 地址。
+- `nodes.json`：累计的节点表。每 20 分钟拉一次 API，按 IP 去重合并；节点超过 `node_max_age_days` 没出现在列表里，或连续连接失败 `node_max_failures` 次，就被淘汰。
+
+环境变量 `LOCAL_PROXY_USER`、`LOCAL_PROXY_PASS`、`LOCAL_PROXY_HOST`、`LOCAL_PROXY_PORT` 覆盖配置但不写回文件；对外服务设 `LOCAL_PROXY_HOST=0.0.0.0`。拉取节点列表遵循 `HTTPS_PROXY` / `HTTP_PROXY`。
 
 ## 目录
 
 | 路径 | 内容 |
 | --- | --- |
-| `go_backend/core` | OpenVPN 3 Core 的 Go 封装与生命周期管理 |
-| `go_backend/gateway` | 隧道池、session 粘滞/TTL、HTTP/SOCKS5 代理 |
-| `go_backend/web` | 节点目录（抓取 VPNGate API、缓存、路由筛选）、配置存储、运行时维护 |
-| `go_backend/nodes` | VPNGate CSV 与 profile 解析 |
-| `go_backend/cmd/vpngate-proxy` | 主程序 |
+| `go_backend/core` | OpenVPN 3 Core 的 Go 封装 |
+| `go_backend/gateway` | 用户名解析、隧道池（每节点一条隧道、会话粘滞/TTL、预热与回收）、HTTP/SOCKS5 代理 |
+| `go_backend/nodes` | VPNGate CSV 与 profile 校验、累计节点表、API 拉取 |
+| `go_backend/cmd/vpngate-proxy` | 主程序与配置 |
 | `go_backend/cmd/{bench,probe,candidate,testserver,testauth}` | 基准、真实节点探针与 CI 测试辅助程序 |
-| `mirror/vpngate.csv` | 打包的离线节点快照（测试夹具，及 API 与本地缓存都不可用时的兜底） |
-
-## 运行
-
-需要 Linux、root 权限和 `/dev/net/tun`。
-
-```bash
-vpngate-proxy --data-dir ./vpngate_data --initialize        # 生成配置并输出代理凭据
-vpngate-proxy --data-dir ./vpngate_data --print-credentials # 查看代理凭据
-sudo vpngate-proxy --data-dir ./vpngate_data                # 启动
-```
-
-代理默认监听 `127.0.0.1:7928`，必须认证：用户名 `session-<ID>[-t-<分钟>]`，密码为配置中的密码或 `LOCAL_PROXY_PASS`。同一 `<ID>` 在 TTL 内复用同一条隧道，TTL 默认 30 分钟，范围 1–1440。
-
-常用环境变量：`VPNGATE_DATA_DIR`、`LOCAL_PROXY_HOST`、`LOCAL_PROXY_PORT`、`LOCAL_PROXY_PASS`、`LOCAL_PROXY_MAX_CONNECTIONS`、`FETCH_INTERVAL_SECONDS`、`VPNGATE_API_HTTPS_URL`、`VPNGATE_API_HTTP_URL`、`VPNGATE_BUNDLED_SNAPSHOT`、`OPENVPN_UPSTREAM_SOCKS`、`OPENVPN_UPSTREAM_HTTP`。
 
 ## 测试
 
-本地不编译、不测试；全部在 GitHub Actions（`.github/workflows/go-gateway.yml`）中执行：编译固定版本的 OpenVPN 3 Core，跑 Go 单测、vet，再在真实 TUN 上做受控 session 验证。手动触发并附带真实 VPNGate 出口验证：
+本地不编译、不测试；全部在 GitHub Actions（`.github/workflows/go-gateway.yml`）中执行：编译固定版本的 OpenVPN 3 Core，跑 Go 单测和 vet，再在受控 OpenVPN 服务端上用真实 TUN 验证粘滞、TTL 换节点和长连接存活。附带真实 VPNGate 出口验证：
 
 ```bash
 gh workflow run go-gateway.yml --repo LimLLL/vpngate-proxy -f live=true

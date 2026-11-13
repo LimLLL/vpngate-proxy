@@ -11,8 +11,8 @@ func TestSOCKS5CredentialsDomainAndBufferedData(t *testing.T) {
 	proxy := testProxy(t)
 	dialer := &recordedDialer{received: make(chan []byte, 1), response: "socks-upstream-ok", respondImmediately: true}
 	proxy.DialerForLease = func(lease *Lease) (LeaseDialer, error) {
-		if lease.Session.ID != "socks" {
-			t.Errorf("unexpected SOCKS session: %+v", lease.Session)
+		if lease.Request.Session != "socks" {
+			t.Errorf("unexpected SOCKS session: %+v", lease.Request)
 		}
 		return dialer, nil
 	}
@@ -22,7 +22,7 @@ func TestSOCKS5CredentialsDomainAndBufferedData(t *testing.T) {
 		defer server.Close()
 		proxy.handle(server)
 	}()
-	username, password := []byte("session-socks-t-1"), []byte("secret")
+	username, password := []byte("acct-session-socks-t-1"), []byte("secret")
 	request := []byte{5, 1, 2, 1, byte(len(username))}
 	request = append(request, username...)
 	request = append(request, byte(len(password)))

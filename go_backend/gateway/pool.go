@@ -5,423 +5,372 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
-	"github.com/LimLLL/vpngate-proxy/go_backend/core"
+	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
-// Endpoint is a connected tunnel. Unit tests use a lifecycle-only fake; the
-// production factory creates official C++ Core sessions and real TUN devices.
+// Endpoint is one connected tunnel. Failure closes on an unexpected disconnect
+// and on a planned Close alike; FailureError is nil for the planned case.
 type Endpoint interface {
 	Device() string
-	Info() (core.ConnectionInfo, error)
 	Failure() <-chan struct{}
 	FailureError() error
 	Close(context.Context) error
 }
 
-type EndpointFactory func(context.Context) (Endpoint, error)
+// Connector opens a tunnel to node on a TUN slot. Slots are unique among live
+// tunnels and are reused only after the previous holder closed successfully.
+type Connector func(ctx context.Context, node nodes.Candidate, slot int) (Endpoint, error)
+
+// NodeSource is satisfied by *nodes.Registry.
+type NodeSource interface {
+	Pick(nodes.Filter, time.Time) []nodes.Candidate
+	ReportSuccess(id string, now time.Time)
+	ReportFailure(id string, now time.Time)
+}
+
+var (
+	// ErrUnavailable means the request was valid but no tunnel could serve it.
+	ErrUnavailable = errors.New("no tunnel available")
+	// ErrSessionConflict means a live session was reused with other parameters.
+	ErrSessionConflict = errors.New("session is active with different parameters")
+	errPoolClosed      = errors.New("pool closed")
+)
+
+// sessionRetention keeps an expired session's last node so the next request
+// with that ID still rotates away from it.
+const sessionRetention = 30 * time.Minute
 
 type PoolConfig struct {
-	MinSpare       int
-	MaxTunnels     int
-	CreateAttempts int
-	ConnectTimeout time.Duration
-	IdleTimeout    time.Duration
-	Factory        EndpointFactory
-	Logf           func(string, ...any)
+	Nodes   NodeSource
+	Connect Connector
+	// MaxTunnels caps concurrent tunnels and is also the number of TUN slots.
+	MaxTunnels int
+	// MinIdle tunnels without a sticky session are kept warm for new sessions.
+	MinIdle int
+	// IdleTimeout closes unused tunnels beyond the warm reserve.
+	IdleTimeout     time.Duration
+	ConnectTimeout  time.Duration
+	ConnectAttempts int
+	Logf            func(string, ...any)
 }
 
-// SessionStatus exposes runtime assignment state without managing native clients.
-type SessionStatus struct {
-	ID      string    `json:"id"`
-	TTL     string    `json:"ttl"`
-	Expires time.Time `json:"expires"`
-	Device  string    `json:"device"`
-	NodeID  string    `json:"node_id,omitempty"`
-	Leases  int       `json:"leases"`
-}
-
-type sessionEntry struct {
-	spec     SessionSpec
+// tunnel is shared by every session and connection routed to its node, since
+// a second tunnel to the same node would not give a different egress IP.
+type tunnel struct {
+	node     nodes.Candidate
+	device   string
+	slot     int
 	endpoint Endpoint
-	expires  time.Time
-	leases   int
+	leases   int // open proxy connections
+	sessions int // unexpired sticky sessions bound here
 	lastUsed time.Time
+	retired  bool
 }
 
+type session struct {
+	request   Request
+	tunnel    *tunnel // nil once expired or after the tunnel died
+	node      string  // last assigned node, excluded when rotating
+	expires   time.Time
+	assigning chan struct{}
+}
+
+// Pool maps requests to tunnels. Expiry only affects new connections; open
+// connections keep their tunnel alive until they finish.
 type Pool struct {
-	mu             sync.Mutex
-	config         PoolConfig
-	sessions       map[string]*sessionEntry
-	spare          []Endpoint
-	assigned       map[Endpoint]struct{}
-	owned          map[Endpoint]struct{}
-	endpointLeases map[Endpoint]int
-	pending        int
-	wake           chan struct{}
-	closed         bool
-	cancel         context.CancelFunc
-	workerCtx      context.Context
-	workers        sync.WaitGroup
-	lifecycle      sync.WaitGroup
+	config PoolConfig
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu        sync.Mutex
+	closed    bool
+	tunnels   map[string]*tunnel
+	opening   map[string]bool
+	sessions  map[string]*session
+	slots     []bool
+	changed   chan struct{} // closed and replaced whenever an open finishes
+	next      int
+	warming   bool
+	warmAfter time.Time
 }
 
-// Lease pins one session egress for a single incoming proxy connection.
+// Lease pins one proxy connection to a tunnel until Release.
 type Lease struct {
-	Session SessionSpec
-	Egress  Endpoint
-	Info    core.ConnectionInfo
-	Expires time.Time
+	Request Request
+	Device  string
+	NodeID  string
+	Country string
 
-	pool  *Pool
-	entry *sessionEntry
-	once  sync.Once
+	pool   *Pool
+	tunnel *tunnel
+	once   sync.Once
 }
 
-// NewPool starts background refresh and idle retirement. TTL expiry takes
-// effect on the next connection, never by migrating established TCP streams.
 func NewPool(parent context.Context, config PoolConfig) (*Pool, error) {
-	if config.Factory == nil {
-		return nil, errors.New("endpoint factory is required")
+	if config.Nodes == nil || config.Connect == nil {
+		return nil, errors.New("pool needs a node source and a connector")
 	}
-	if config.MinSpare < 0 || config.MaxTunnels < 1 || config.MinSpare > config.MaxTunnels {
-		return nil, fmt.Errorf("spare %d must be within capacity %d", config.MinSpare, config.MaxTunnels)
+	if config.MaxTunnels < 1 || config.MinIdle < 0 || config.MinIdle > config.MaxTunnels {
+		return nil, fmt.Errorf("warm reserve %d must fit within %d tunnels", config.MinIdle, config.MaxTunnels)
 	}
-	if config.CreateAttempts < 1 {
-		return nil, errors.New("create attempts must be positive")
-	}
-	if config.ConnectTimeout <= 0 || config.IdleTimeout <= 0 {
-		return nil, errors.New("connect and idle durations must be positive")
+	if config.IdleTimeout <= 0 || config.ConnectTimeout <= 0 || config.ConnectAttempts < 1 {
+		return nil, errors.New("pool timeouts and connect attempts must be positive")
 	}
 	if config.Logf == nil {
 		config.Logf = log.Printf
 	}
 	ctx, cancel := context.WithCancel(parent)
-	p := &Pool{config: config, sessions: make(map[string]*sessionEntry),
-		assigned: make(map[Endpoint]struct{}), endpointLeases: make(map[Endpoint]int),
-		owned: make(map[Endpoint]struct{}),
-		wake:  make(chan struct{}), cancel: cancel, workerCtx: ctx}
-	p.lifecycle.Add(1)
-	go func() {
-		defer p.lifecycle.Done()
-		p.reclaimer(ctx)
-	}()
+	p := &Pool{
+		config: config, ctx: ctx, cancel: cancel,
+		tunnels: make(map[string]*tunnel), opening: make(map[string]bool),
+		sessions: make(map[string]*session), slots: make([]bool, config.MaxTunnels),
+		changed: make(chan struct{}),
+	}
+	p.wg.Add(1)
+	go p.maintain()
 	return p, nil
 }
 
-func (p *Pool) signal() {
-	close(p.wake)
-	p.wake = make(chan struct{})
-}
-
-// build reserves worker lifetime before closing can wait on it. Factory must
-// honor the pool's connection timeout, since native setup is not interruptible.
-func (p *Pool) build() (Endpoint, error) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, errors.New("pool closed")
-	}
-	p.workers.Add(1)
-	p.mu.Unlock()
-	endpoint, err := p.config.Factory(p.workerCtx)
-	if err != nil {
-		p.workers.Done()
-		return nil, err
-	}
-	go p.monitor(endpoint)
-	p.mu.Lock()
-	if p.closed || terminal(endpoint) {
-		p.mu.Unlock()
-		p.close(endpoint)
-		return nil, errors.New("tunnel failed or pool closed during setup")
-	}
-	p.owned[endpoint] = struct{}{}
-	p.spare = append(p.spare, endpoint)
-	p.pending--
-	p.signal()
-	p.mu.Unlock()
-	return endpoint, nil
-}
-
-func (p *Pool) monitor(endpoint Endpoint) {
-	defer p.workers.Done()
-	<-endpoint.Failure()
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	delete(p.assigned, endpoint)
-	delete(p.endpointLeases, endpoint)
-	p.removeSpare(endpoint)
-	p.signal()
-	p.mu.Unlock()
-	if err := endpoint.FailureError(); err != nil {
-		p.config.Logf("tunnel disconnected %s: %v", endpoint.Device(), err)
-	}
-	p.close(endpoint)
-}
-
-func (p *Pool) removeSpare(endpoint Endpoint) {
-	for i, candidate := range p.spare {
-		if candidate == endpoint {
-			p.spare = append(p.spare[:i], p.spare[i+1:]...)
-			return
+// Acquire returns a lease for one new proxy connection.
+func (p *Pool) Acquire(ctx context.Context, request Request) (*Lease, error) {
+	if request.Session == "" {
+		t, err := p.choose(ctx, request.Country, "", false)
+		if err != nil {
+			return nil, err
 		}
+		return p.lease(request, t), nil
 	}
-}
-
-// Acquire binds a sticky session to an available, healthy and unexpired tunnel.
-func (p *Pool) Acquire(ctx context.Context, spec SessionSpec) (*Lease, error) {
 	for {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return nil, errors.New("pool closed")
+			return nil, errPoolClosed
 		}
 		now := time.Now()
-		entry := p.sessions[spec.ID]
-		var avoid Endpoint
-		if entry != nil && !SameSession(entry.spec, spec) {
+		s := p.sessions[request.Session]
+		if s != nil && s.assigning != nil {
+			// Another connection of this session is choosing its tunnel.
+			wait := s.assigning
 			p.mu.Unlock()
-			return nil, fmt.Errorf("session %q cannot be used with a different TTL", spec.ID)
-		}
-		if entry != nil {
-			if now.Before(entry.expires) && !terminal(entry.endpoint) {
-				entry.leases++
-				p.endpointLeases[entry.endpoint]++
-				entry.lastUsed = now
-				info, err := safeInfo(entry.endpoint)
-				p.mu.Unlock()
-				lease := &Lease{Session: spec, Egress: entry.endpoint,
-					Info: info, Expires: entry.expires, pool: p, entry: entry}
-				if err != nil {
-					lease.Release()
-					return nil, err
-				}
-				return lease, nil
-			}
-			avoid = entry.endpoint
-			p.unassign(entry)
-			delete(p.sessions, spec.ID)
-		}
-		for _, endpoint := range p.spare {
-			if endpoint != avoid {
-				return p.useEndpoint(spec, endpoint, now)
-			}
-		}
-		if len(p.spare)+len(p.assigned)+p.pending < p.config.MaxTunnels {
-			p.pending++
-			p.signal()
-			p.mu.Unlock()
-			_, err := p.build()
-			if err != nil {
-				p.mu.Lock()
-				p.pending--
-				p.signal()
-				p.mu.Unlock()
-				return nil, fmt.Errorf("connect tunnel for %q: %w", spec.ID, err)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-wait:
 			}
 			continue
 		}
-		if p.pending == 0 {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("no other healthy tunnel available for session assignment %q", spec.ID)
+		if s != nil && now.Before(s.expires) {
+			if s.request != request {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("%w: %q", ErrSessionConflict, request.Session)
+			}
+			if t := s.tunnel; t != nil && !t.retired {
+				t.leases++
+				t.lastUsed = now
+				p.mu.Unlock()
+				return p.lease(request, t), nil
+			}
 		}
-		wake := p.wake
+		exclude := ""
+		if s == nil {
+			s = &session{}
+			p.sessions[request.Session] = s
+		} else {
+			exclude = s.node
+			p.unbind(s)
+		}
+		s.request = request
+		wait := make(chan struct{})
+		s.assigning = wait
+		p.mu.Unlock()
+
+		t, err := p.choose(ctx, request.Country, exclude, true)
+
+		p.mu.Lock()
+		s.assigning = nil
+		close(wait)
+		if err != nil {
+			if s.node == "" {
+				delete(p.sessions, request.Session)
+			}
+			p.mu.Unlock()
+			return nil, err
+		}
+		s.tunnel, s.node = t, t.node.ID
+		s.expires = time.Now().Add(request.TTL)
+		p.mu.Unlock()
+		return p.lease(request, t), nil
+	}
+}
+
+// choose returns a tunnel with a lease, and for sticky requests the session,
+// already counted under the same lock that picked it, so concurrent new
+// sessions cannot both claim the same free tunnel. Sticky sessions prefer a
+// tunnel no other session uses, then a new node, and share only as a last
+// resort; rotating connections take live tunnels in turn. While other opens
+// are in flight it waits for them rather than failing, which matters for the
+// burst of requests right after startup.
+func (p *Pool) choose(ctx context.Context, country, exclude string, sticky bool) (*tunnel, error) {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errPoolClosed
+		}
+		if t := p.pickLive(country, exclude, sticky, false); t != nil {
+			p.mu.Unlock()
+			return t, nil
+		}
+		p.mu.Unlock()
+		t, openErr := p.open(ctx, country, exclude, sticky)
+		if t != nil {
+			return t, nil
+		}
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errPoolClosed
+		}
+		if t := p.pickLive(country, exclude, sticky, true); t != nil {
+			p.mu.Unlock()
+			return t, nil
+		}
+		if t := p.tunnels[exclude]; exclude != "" && t != nil && matches(t, country) {
+			p.config.Logf("no other node for country %q; session stays on %s", country, exclude)
+			p.take(t, sticky)
+			p.mu.Unlock()
+			return t, nil
+		}
+		if len(p.opening) == 0 {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w for country %q: %v", ErrUnavailable, country, openErr)
+		}
+		wait := p.changed
 		p.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("wait for tunnel: %w", ctx.Err())
-		case <-wake:
+			return nil, fmt.Errorf("%w for country %q: %v", ErrUnavailable, country, ctx.Err())
+		case <-wait:
 		}
 	}
 }
 
-func (p *Pool) useEndpoint(spec SessionSpec, endpoint Endpoint, now time.Time) (*Lease, error) {
-	if terminal(endpoint) {
-		p.signal()
-		p.mu.Unlock()
-		return nil, errors.New("tunnel failed during assignment")
-	}
-	p.removeSpare(endpoint)
-	p.assigned[endpoint] = struct{}{}
-	p.endpointLeases[endpoint]++
-	entry := &sessionEntry{spec: spec, endpoint: endpoint, expires: now.Add(spec.TTL), leases: 1, lastUsed: now}
-	p.sessions[spec.ID] = entry
-	info, err := safeInfo(endpoint)
-	p.signal()
-	p.mu.Unlock()
-	lease := &Lease{Session: spec, Egress: endpoint, Info: info, Expires: entry.expires, pool: p, entry: entry}
-	if err != nil {
-		lease.Release()
-		return nil, err
-	}
-	return lease, nil
+// notify must be called with p.mu held.
+func (p *Pool) notify() {
+	close(p.changed)
+	p.changed = make(chan struct{})
 }
 
-func safeInfo(endpoint Endpoint) (info core.ConnectionInfo, err error) {
-	if terminal(endpoint) {
-		return info, errors.New("tunnel is no longer connected")
+// pickLive must be called with p.mu held; it takes the result like choose.
+func (p *Pool) pickLive(country, exclude string, sticky, share bool) *tunnel {
+	var live []*tunnel
+	for id, t := range p.tunnels {
+		if id != exclude && matches(t, country) && (!sticky || share || t.sessions == 0) {
+			live = append(live, t)
+		}
 	}
-	return endpoint.Info()
+	if len(live) == 0 {
+		return nil
+	}
+	sort.Slice(live, func(i, j int) bool {
+		a, b := live[i], live[j]
+		if sticky && a.sessions != b.sessions {
+			return a.sessions < b.sessions
+		}
+		if sticky && a.leases != b.leases {
+			return a.leases < b.leases
+		}
+		return a.node.ID < b.node.ID
+	})
+	t := live[0]
+	if !sticky {
+		t = live[p.next%len(live)]
+		p.next++
+	}
+	p.take(t, sticky)
+	return t
 }
 
-func terminal(endpoint Endpoint) bool {
-	select {
-	case <-endpoint.Failure():
-		return true
-	default:
-		return false
+func (p *Pool) take(t *tunnel, sticky bool) {
+	t.leases++
+	if sticky {
+		t.sessions++
+	}
+	t.lastUsed = time.Now()
+}
+
+func matches(t *tunnel, country string) bool {
+	return !t.retired && (country == "" || t.node.Country == country)
+}
+
+func (p *Pool) unbind(s *session) {
+	if s.tunnel != nil {
+		s.tunnel.sessions--
+		s.tunnel = nil
 	}
 }
 
-func (p *Pool) unassign(entry *sessionEntry) {
-	if p.endpointLeases[entry.endpoint] > 0 {
-		// A prior generation can outlive its session mapping. Keep that TUN
-		// assigned solely to the old TCP connections until their leases end.
-		return
-	}
-	delete(p.assigned, entry.endpoint)
-	if !terminal(entry.endpoint) {
-		p.spare = append(p.spare, entry.endpoint)
-	}
-	p.signal()
+func (p *Pool) lease(request Request, t *tunnel) *Lease {
+	return &Lease{Request: request, Device: t.device, NodeID: t.node.ID,
+		Country: t.node.Country, pool: p, tunnel: t}
 }
 
-// Release finishes one lease without interfering with other live connections.
 func (l *Lease) Release() {
 	l.once.Do(func() {
 		l.pool.mu.Lock()
-		if l.pool.endpointLeases[l.Egress] > 0 {
-			l.pool.endpointLeases[l.Egress]--
-		}
-		entry := l.pool.sessions[l.Session.ID]
-		if entry != nil && entry == l.entry {
-			if entry.leases > 0 {
-				entry.leases--
-			}
-			entry.lastUsed = time.Now()
-		}
-		if l.pool.endpointLeases[l.Egress] == 0 {
-			delete(l.pool.endpointLeases, l.Egress)
-			inUse := false
-			for _, current := range l.pool.sessions {
-				if current.endpoint == l.Egress {
-					inUse = true
-					break
-				}
-			}
-			if _, assigned := l.pool.assigned[l.Egress]; assigned && !inUse {
-				delete(l.pool.assigned, l.Egress)
-				if !terminal(l.Egress) && !l.pool.closed {
-					l.pool.spare = append(l.pool.spare, l.Egress)
-				}
-			}
-		}
-		l.pool.signal()
+		l.tunnel.leases--
+		l.tunnel.lastUsed = time.Now()
 		l.pool.mu.Unlock()
 	})
 }
 
-// Warm keeps a healthy reserve without leaving pending funds behind on error.
-func (p *Pool) Warm(ctx context.Context, count int) error {
-	if count < 0 {
-		return errors.New("warm count cannot be negative")
-	}
-	if count > p.config.MaxTunnels {
-		return fmt.Errorf("warm count exceeds capacity %d", p.config.MaxTunnels)
-	}
-	for {
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return errors.New("pool closed")
-		}
-		missing := count - len(p.spare) - len(p.assigned) - p.pending
-		if missing <= 0 {
-			p.mu.Unlock()
-			return nil
-		}
-		if len(p.spare)+len(p.assigned)+p.pending >= p.config.MaxTunnels {
-			p.mu.Unlock()
-			return errors.New("all endpoints assigned before meeting warm target")
-		}
-		p.pending++
-		p.signal()
-		p.mu.Unlock()
-		var err error
-		select {
-		case <-ctx.Done():
-			err = ctx.Err()
-		default:
-			_, err = p.build()
-		}
-		if err != nil {
-			p.mu.Lock()
-			p.pending--
-			p.signal()
-			p.mu.Unlock()
-			return fmt.Errorf("warm tunnel: %w", err)
-		}
-	}
+type TunnelStatus struct {
+	Node     string
+	Country  string
+	Device   string
+	Sessions int
+	Leases   int
 }
 
-func (p *Pool) reclaimer(ctx context.Context) {
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			p.mu.Lock()
-			if p.closed {
-				p.mu.Unlock()
-				return
-			}
-			now := time.Now()
-			for key, entry := range p.sessions {
-				if entry.leases == 0 && now.Sub(entry.lastUsed) >= p.config.IdleTimeout {
-					p.unassign(entry)
-					delete(p.sessions, key)
-				}
-			}
-			var discard []Endpoint
-			for len(p.spare) > p.config.MinSpare {
-				last := len(p.spare) - 1
-				discard = append(discard, p.spare[last])
-				p.spare = p.spare[:last]
-			}
-			p.signal()
-			p.mu.Unlock()
-			for _, endpoint := range discard {
-				p.close(endpoint)
-			}
-			if count := p.config.MinSpare; count > 0 && ctx.Err() == nil {
-				if err := p.Warm(ctx, count); err != nil && ctx.Err() == nil {
-					p.config.Logf("%v", err)
-				}
-			}
-		}
-	}
+type SessionStatus struct {
+	ID      string
+	Node    string
+	Device  string // empty when the session currently has no live tunnel
+	Expires time.Time
 }
 
-func (p *Pool) close(endpoint Endpoint) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err := endpoint.Close(ctx)
-	if err != nil {
-		p.config.Logf("close %s: %v", endpoint.Device(), err)
-	}
+type PoolStatus struct {
+	Tunnels  []TunnelStatus
+	Sessions []SessionStatus
+}
+
+func (p *Pool) Status() PoolStatus {
 	p.mu.Lock()
-	delete(p.owned, endpoint)
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	var status PoolStatus
+	for _, t := range p.tunnels {
+		status.Tunnels = append(status.Tunnels, TunnelStatus{Node: t.node.ID, Country: t.node.Country,
+			Device: t.device, Sessions: t.sessions, Leases: t.leases})
+	}
+	for id, s := range p.sessions {
+		entry := SessionStatus{ID: id, Node: s.node, Expires: s.expires}
+		if s.tunnel != nil && !s.tunnel.retired {
+			entry.Device = s.tunnel.device
+		}
+		status.Sessions = append(status.Sessions, entry)
+	}
+	sort.Slice(status.Tunnels, func(i, j int) bool { return status.Tunnels[i].Device < status.Tunnels[j].Device })
+	sort.Slice(status.Sessions, func(i, j int) bool { return status.Sessions[i].ID < status.Sessions[j].ID })
+	return status
 }
 
+// Close stops maintenance and closes every tunnel; open proxy connections
+// should be closed first.
 func (p *Pool) Close() error {
 	p.mu.Lock()
 	if p.closed {
@@ -430,77 +379,22 @@ func (p *Pool) Close() error {
 	}
 	p.closed = true
 	p.cancel()
-	endpoints := make([]Endpoint, 0, len(p.owned))
-	for endpoint := range p.owned {
-		endpoints = append(endpoints, endpoint)
-	}
-	p.spare = nil
-	p.assigned = make(map[Endpoint]struct{})
-	p.sessions = make(map[string]*sessionEntry)
-	p.endpointLeases = make(map[Endpoint]int)
-	p.signal()
-	p.mu.Unlock()
-	// Native completion releases monitor goroutines, so stop live endpoints
-	// before waiting. Setup workers still close resources created concurrently.
-	for _, endpoint := range endpoints {
-		p.close(endpoint)
-	}
-	p.workers.Wait()
-	p.lifecycle.Wait()
-	p.mu.Lock()
-	for endpoint := range p.owned {
-		endpoints = append(endpoints, endpoint)
+	var all []*tunnel
+	for _, t := range p.tunnels {
+		p.retire(t)
+		all = append(all, t)
 	}
 	p.mu.Unlock()
-	for _, endpoint := range endpoints {
-		p.close(endpoint)
+	errs := make(chan error, len(all))
+	for _, t := range all {
+		go func(t *tunnel) { errs <- p.closeTunnel(t) }(t)
 	}
-	return nil
-}
-
-// Status returns session count, spare identities and current ticket bindings.
-func (p *Pool) Status() (active int, spare []SessionStatus, connected []SessionStatus) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	connected = make([]SessionStatus, 0, len(p.sessions))
-	for id, entry := range p.sessions {
-		status := SessionStatus{ID: id, TTL: entry.spec.TTL.String(), Expires: entry.expires,
-			Leases: entry.leases}
-		if !terminal(entry.endpoint) {
-			status.Device = entry.endpoint.Device()
-		}
-		if native, ok := entry.endpoint.(interface{ CandidateID() string }); ok {
-			status.NodeID = native.CandidateID()
-		}
-		connected = append(connected, status)
-	}
-	for _, endpoint := range p.spare {
-		if !terminal(endpoint) {
-			spare = append(spare, SessionStatus{Device: endpoint.Device()})
+	var failures []error
+	for range all {
+		if err := <-errs; err != nil {
+			failures = append(failures, err)
 		}
 	}
-	active = len(p.sessions)
-	return active, spare, connected
-}
-
-// Invalidate closes unused prewarmed tunnels so a new routing policy cannot
-// accidentally reuse them. Active leases keep their native endpoints alive.
-func (p *Pool) Invalidate() {
-	p.mu.Lock()
-	for _, entry := range p.sessions {
-		entry.expires = time.Now()
-	}
-	spare := append([]Endpoint(nil), p.spare...)
-	p.spare = nil
-	p.signal()
-	p.mu.Unlock()
-	for _, endpoint := range spare {
-		p.close(endpoint)
-	}
-}
-
-func (p *Pool) Pending() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.pending
+	p.wg.Wait()
+	return errors.Join(failures...)
 }

@@ -131,9 +131,10 @@ func NewClient(profile, username, password string, connectTimeout int) (*Client,
 	return c, nil
 }
 
-// Connect starts a session and waits for its native CONNECTED event. Logging
-// remains available on C++'s own connection thread; supervisory events continue
-// on this controller's goroutine after this method returns.
+// Connect starts a session and waits for its native CONNECTED event. Whatever
+// the outcome, a supervisor keeps consuming events until the native thread
+// exits: the C++ callback blocks on a full channel, and a blocked thread could
+// never finish the stop that Close waits for.
 func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 	c.mu.Lock()
 	if c.started || c.closing || c.closed {
@@ -156,14 +157,13 @@ func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 				c.OnEvent(event)
 			}
 			if event.Fatal {
+				c.recordFailure(event)
+				go c.supervise()
 				return ConnectionInfo{}, fmt.Errorf("OpenVPN 3 %s: %s", event.Name, event.Info)
 			}
 			if event.Name == "CONNECTED" {
-				info, err := c.ConnectionInfo()
-				if err == nil {
-					go c.supervise()
-				}
-				return info, err
+				go c.supervise()
+				return c.ConnectionInfo()
 			}
 		case <-c.done:
 			c.mu.Lock()
@@ -174,6 +174,7 @@ func (c *Client) Connect(ctx context.Context) (ConnectionInfo, error) {
 			}
 			return ConnectionInfo{}, err
 		case <-ctx.Done():
+			go c.supervise()
 			return ConnectionInfo{}, ctx.Err()
 		}
 	}
@@ -190,6 +191,8 @@ func (c *Client) complete(err error) {
 	close(c.done)
 }
 
+// supervise runs until the native thread exits, turning fatal events into
+// Failure without ever leaving the event channel unread.
 func (c *Client) supervise() {
 	for {
 		select {
@@ -198,18 +201,21 @@ func (c *Client) supervise() {
 				c.OnEvent(event)
 			}
 			if event.Fatal {
-				c.mu.Lock()
-				if c.failureErr == nil && !c.closing {
-					c.failureErr = fmt.Errorf("OpenVPN 3 %s: %s", event.Name, event.Info)
-				}
-				c.mu.Unlock()
-				c.failureOnce.Do(func() { close(c.failure) })
-				return
+				c.recordFailure(event)
 			}
 		case <-c.done:
 			return
 		}
 	}
+}
+
+func (c *Client) recordFailure(event Event) {
+	c.mu.Lock()
+	if c.failureErr == nil && !c.closing {
+		c.failureErr = fmt.Errorf("OpenVPN 3 %s: %s", event.Name, event.Info)
+	}
+	c.mu.Unlock()
+	c.failureOnce.Do(func() { close(c.failure) })
 }
 
 // Failure closes for both unexpected disconnects and planned native stop.

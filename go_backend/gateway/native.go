@@ -5,87 +5,41 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/LimLLL/vpngate-proxy/go_backend/core"
+	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
-type CandidateSource interface {
-	Next(context.Context) (Candidate, error)
-}
-
-type NativeConfig struct {
-	Source  CandidateSource
-	Timeout time.Duration
-	Backoff time.Duration
-	TUNBase uint64
-}
-
-// NativeFactory returns one connected native tunnel per factory invocation.
-// Caller controls its slot exclusivity; children do not share transport state.
-type NativeFactory struct {
-	config NativeConfig
-	next   atomic.Uint64
-}
-
-func NewNativeFactory(config NativeConfig) (*NativeFactory, error) {
-	if config.Source == nil {
-		return nil, errors.New("native profile source is required")
-	}
-	if config.Timeout <= 0 {
-		return nil, errors.New("native connect timeout must be positive")
-	}
-	return &NativeFactory{config: config}, nil
-}
-
-// Connect creates an isolated endpoint for probe or explicit node requests.
-func (f *NativeFactory) Connect(ctx context.Context, candidate Candidate) (Endpoint, error) {
-	return f.connect(ctx, candidate)
-}
-
-func (f *NativeFactory) Factory() EndpointFactory {
-	return func(ctx context.Context) (Endpoint, error) {
-		connectCtx, cancel := context.WithTimeout(ctx, f.config.Timeout)
-		defer cancel()
-		var errs []error
-		for attempt := 0; attempt < 3; attempt++ {
-			candidate, err := f.config.Source.Next(connectCtx)
-			if err != nil {
-				return nil, err
-			}
-			endpoint, err := f.connect(connectCtx, candidate)
-			if err == nil {
-				log.Printf("native connected %s on %s", endpoint.Device(), candidate.ID)
-				return endpoint, nil
-			}
-			diagnostic := fmt.Errorf("candidate %s attempt %d: %w", candidate.ID, attempt+1, err)
-			log.Printf("%v", diagnostic)
-			errs = append(errs, diagnostic)
-			if connectCtx.Err() != nil {
-				break
-			}
-			if f.config.Backoff > 0 {
-				select {
-				case <-connectCtx.Done():
-					continue
-				case <-time.After(f.config.Backoff):
-				}
-			}
+// NativeConnector opens tunnels with the embedded OpenVPN 3 Core. Slot n
+// uses device tun<tunBase+n>, routing table 2000+n and rule priority 20000+n.
+func NativeConnector(tunBase int, timeout time.Duration) Connector {
+	return func(ctx context.Context, node nodes.Candidate, slot int) (Endpoint, error) {
+		tunnel, err := ConnectNative(ctx, node, fmt.Sprintf("tun%d", tunBase+slot), slot, timeout)
+		if err != nil {
+			return nil, err
 		}
-		return nil, errors.Join(errs...)
+		return tunnel, nil
 	}
 }
 
-func (f *NativeFactory) connect(ctx context.Context, candidate Candidate) (Endpoint, error) {
-	slot := f.next.Add(1) - 1
-	device := fmt.Sprintf("tun%d", f.config.TUNBase+slot)
-	profile := PrepareProfile(candidate.Profile, device)
-	seconds := int(f.config.Timeout / time.Second)
-	if seconds < 1 {
-		seconds = 1
-	}
-	client, err := core.NewClient(profile, "vpn", "vpn", seconds)
+// NativeTunnel is one OpenVPN 3 Core session with its policy route.
+type NativeTunnel struct {
+	client  *core.Client
+	device  string
+	cleanup func() error
+	routed  atomic.Bool
+}
+
+// ConnectNative connects node on device and routes traffic from sockets bound
+// to that device through it. VPNGate accepts the fixed vpn/vpn login.
+func ConnectNative(ctx context.Context, node nodes.Candidate, device string, slot int, timeout time.Duration) (*NativeTunnel, error) {
+	seconds := max(1, int(timeout/time.Second))
+	client, err := core.NewClient(nodes.PrepareProfile(node.Profile, device), "vpn", "vpn", seconds)
 	if err != nil {
 		return nil, err
 	}
@@ -99,16 +53,32 @@ func (f *NativeFactory) connect(ctx context.Context, candidate Candidate) (Endpo
 		closeClient(client)
 		return nil, err
 	}
-	if !info.Defined || info.TUNName != device {
+	if info.TUNName != device {
 		closeClient(client)
-		return nil, fmt.Errorf("native expected %s, got %q", device, info.TUNName)
+		return nil, fmt.Errorf("expected %s, Core opened %q", device, info.TUNName)
 	}
-	cleanup, err := RouteInstall(device, slot)
+	cleanup, err := installRoute(device, slot)
 	if err != nil {
 		closeClient(client)
 		return nil, err
 	}
-	return &nativeEndpoint{client: client, cleanup: cleanup, nodeID: candidate.ID}, nil
+	tunnel := &NativeTunnel{client: client, device: device, cleanup: cleanup}
+	tunnel.routed.Store(true)
+	return tunnel, nil
+}
+
+func (n *NativeTunnel) Device() string                     { return n.device }
+func (n *NativeTunnel) Info() (core.ConnectionInfo, error) { return n.client.ConnectionInfo() }
+func (n *NativeTunnel) Failure() <-chan struct{}           { return n.client.Failure() }
+func (n *NativeTunnel) FailureError() error                { return n.client.FailureError() }
+
+func (n *NativeTunnel) Close(ctx context.Context) error {
+	clientErr := n.client.Close(ctx)
+	var routeErr error
+	if n.routed.CompareAndSwap(true, false) {
+		routeErr = n.cleanup()
+	}
+	return errors.Join(clientErr, routeErr)
 }
 
 func closeClient(client *core.Client) {
@@ -117,4 +87,49 @@ func closeClient(client *core.Client) {
 	if err := client.Close(ctx); err != nil {
 		log.Printf("close native client: %v", err)
 	}
+}
+
+// installRoute sends traffic leaving device through it via a per-slot table.
+// The profile's route-nopull keeps the main table, and with it the OpenVPN
+// transport socket, on the physical uplink.
+func installRoute(device string, slot int) (func() error, error) {
+	if slot < 0 || slot > 10000 {
+		return nil, fmt.Errorf("tunnel slot %d is outside the supported range", slot)
+	}
+	table := strconv.Itoa(2000 + slot)
+	priority := strconv.Itoa(20000 + slot)
+	cleanup := func() error {
+		var first error
+		for _, command := range [][]string{
+			{"ip", "rule", "del", "priority", priority},
+			{"ip", "route", "flush", "table", table},
+		} {
+			if output, err := exec.Command(command[0], command[1:]...).CombinedOutput(); err != nil && first == nil {
+				first = fmt.Errorf("%s: %w: %s", strings.Join(command, " "), err, output)
+			}
+		}
+		return first
+	}
+	for _, command := range [][]string{
+		{"ip", "route", "replace", "default", "dev", device, "table", table},
+		{"ip", "rule", "add", "priority", priority, "oif", device, "table", table},
+	} {
+		if output, err := exec.Command(command[0], command[1:]...).CombinedOutput(); err != nil {
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				log.Printf("roll back routes for %s: %v", device, cleanupErr)
+			}
+			return nil, fmt.Errorf("%s: %w: %s", strings.Join(command, " "), err, output)
+		}
+	}
+	// Loose reverse-path filtering, or replies arriving on the TUN are dropped.
+	for _, prefix := range []string{"all", "default", device} {
+		key := "net.ipv4.conf." + prefix + ".rp_filter"
+		if output, err := exec.Command("sysctl", "-w", key+"=2").CombinedOutput(); err != nil {
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				log.Printf("roll back routes for %s: %v", device, cleanupErr)
+			}
+			return nil, fmt.Errorf("%s=2: %w: %s", key, err, output)
+		}
+	}
+	return cleanup, nil
 }

@@ -26,32 +26,35 @@ type LeaseDialer interface {
 	ResolveIPv4(context.Context, string) ([]net.IP, error)
 }
 
+// errAuth marks credential and username errors, answered with 407.
+var errAuth = errors.New("proxy authentication failed")
+
 type Proxy struct {
-	pool       *Pool
-	passwordMu sync.RWMutex
-	password   string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	listeners  sync.Map
-	wg         sync.WaitGroup
-	MaxConns   chan struct{}
-	// Enabled can reject new proxy traffic after a management-level stop.
-	Enabled        func() bool
+	pool      *Pool
+	account   string
+	password  string
+	ctx       context.Context
+	cancel    context.CancelFunc
+	listeners sync.Map
+	wg        sync.WaitGroup
+	maxConns  chan struct{}
+	// DialerForLease replaces the TUN-bound dialer in tests.
 	DialerForLease func(*Lease) (LeaseDialer, error)
 }
 
-func NewProxy(parent context.Context, pool *Pool, password string, maxConnections int) (*Proxy, error) {
+func NewProxy(parent context.Context, pool *Pool, account, password string, maxConnections int) (*Proxy, error) {
 	if pool == nil {
-		return nil, errors.New("proxy requires a session pool")
+		return nil, errors.New("proxy requires a tunnel pool")
 	}
-	if password == "" {
-		return nil, errors.New("proxy password must not be empty")
+	if account == "" || password == "" {
+		return nil, errors.New("proxy account and password must not be empty")
 	}
 	if maxConnections < 1 {
 		return nil, errors.New("max connections must be positive")
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &Proxy{ctx: ctx, pool: pool, password: password, cancel: cancel, MaxConns: make(chan struct{}, maxConnections)}, nil
+	return &Proxy{ctx: ctx, cancel: cancel, pool: pool, account: account, password: password,
+		maxConns: make(chan struct{}, maxConnections)}, nil
 }
 
 // Serve supports both HTTP proxying and SOCKS5 on the same listener. Binding
@@ -73,11 +76,11 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			return fmt.Errorf("proxy accept: %w", err)
 		}
 		select {
-		case p.MaxConns <- struct{}{}:
+		case p.maxConns <- struct{}{}:
 			p.wg.Add(1)
 			go func() {
 				defer p.wg.Done()
-				defer func() { <-p.MaxConns }()
+				defer func() { <-p.maxConns }()
 				defer client.Close()
 				p.handle(client)
 			}()
@@ -133,41 +136,28 @@ func (p *Proxy) handle(client net.Conn) {
 	p.handleHTTP(client, reader)
 }
 
-// SetPassword atomically applies a saved management credential update.
-func (p *Proxy) SetPassword(password string) {
-	p.passwordMu.Lock()
-	p.password = password
-	p.passwordMu.Unlock()
-}
-
-func (p *Proxy) lease(ctx context.Context, username, password string) (*Lease, error) {
-	if p.Enabled != nil && !p.Enabled() {
-		return nil, errors.New("proxy is disabled by the management configuration")
+func (p *Proxy) authenticate(username, password string) (Request, error) {
+	if subtle.ConstantTimeCompare([]byte(password), []byte(p.password)) != 1 {
+		return Request{}, errAuth
 	}
-
-	if !p.validCredentials(username, password) {
-		return nil, errors.New("proxy authentication failed or session is invalid")
-	}
-	spec, err := ParseSession(username)
+	request, err := ParseUsername(p.account, username)
 	if err != nil {
-		return nil, err
+		return Request{}, fmt.Errorf("%w: %v", errAuth, err)
 	}
-	return p.pool.Acquire(ctx, spec)
+	return request, nil
 }
 
 func (p *Proxy) validCredentials(username, password string) bool {
-	p.passwordMu.RLock()
-	expected := p.password
-	p.passwordMu.RUnlock()
-	if subtle.ConstantTimeCompare([]byte(password), []byte(expected)) != 1 {
-		return false
-	}
-	_, err := ParseSession(username)
+	_, err := p.authenticate(username, password)
 	return err == nil
 }
 
 func (p *Proxy) acquireTunnel(ctx context.Context, username, password string) (*Lease, LeaseDialer, error) {
-	lease, err := p.lease(ctx, username, password)
+	request, err := p.authenticate(username, password)
+	if err != nil {
+		return nil, nil, err
+	}
+	lease, err := p.pool.Acquire(ctx, request)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -179,11 +169,13 @@ func (p *Proxy) acquireTunnel(ctx context.Context, username, password string) (*
 		}
 		return lease, dialer, nil
 	}
-	if lease.Info.TUNName == "" {
-		lease.Release()
-		return nil, nil, errors.New("session has no tunnel interface")
-	}
-	return lease, DeviceDialer{Device: lease.Info.TUNName, DNS: "8.8.8.8"}, nil
+	return lease, DeviceDialer{Device: lease.Device, DNS: "8.8.8.8"}, nil
+}
+
+// rejected reports whether err is the client's fault (407) rather than a
+// shortage of tunnels (503).
+func rejected(err error) bool {
+	return errors.Is(err, errAuth) || errors.Is(err, ErrSessionConflict)
 }
 
 func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {
@@ -198,18 +190,27 @@ func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {
 		return
 	}
 	user, password, err := proxyBasicCredentials(request.Header.Get("Proxy-Authorization"))
+	if err != nil {
+		p.authenticationError(client, err)
+		return
+	}
 	ctx, cancel := context.WithTimeout(p.ctx, 45*time.Second)
 	defer cancel()
 	lease, egress, err := p.acquireTunnel(ctx, user, password)
-	if err != nil {
+	if rejected(err) {
 		p.authenticationError(client, err)
+		return
+	}
+	if err != nil {
+		log.Printf("no tunnel for %q: %v", user, err)
+		writeHTTP(client, http.StatusServiceUnavailable)
 		return
 	}
 	defer lease.Release()
 	if request.Method == http.MethodConnect {
 		host, port, err := proxyAuthority(request.Host)
 		if err != nil {
-			writeHTTP(client, http.StatusBadRequest, "Content-Length: 0")
+			writeHTTP(client, http.StatusBadRequest)
 			return
 		}
 		p.connectHTTP(ctx, readerConn{Reader: reader, Conn: client}, egress, host, port)
@@ -223,13 +224,13 @@ func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {
 		}
 		parsed, err := url.Parse("http://" + authority)
 		if err != nil {
-			writeHTTP(client, http.StatusBadRequest, "Content-Length: 0")
+			writeHTTP(client, http.StatusBadRequest)
 			return
 		}
 		target = parsed
 	}
 	if target.Scheme != "http" {
-		writeHTTP(client, http.StatusNotImplemented, "Content-Length: 0")
+		writeHTTP(client, http.StatusNotImplemented)
 		return
 	}
 	port, err := strconv.Atoi(target.Port())
@@ -237,7 +238,7 @@ func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {
 		port = 80
 	}
 	if err != nil || port < 1 || port > 65535 {
-		writeHTTP(client, http.StatusBadRequest, "Content-Length: 0")
+		writeHTTP(client, http.StatusBadRequest)
 		return
 	}
 	request.URL.Path = target.Path
@@ -259,8 +260,8 @@ func (p *Proxy) handleHTTP(client net.Conn, reader *bufio.Reader) {
 	}
 	upstream, err := egress.DialContext(ctx, target.Hostname(), port)
 	if err != nil {
-		log.Printf("%s HTTP %s: %v", lease.Info.TUNName, target.Host, err)
-		writeHTTP(client, http.StatusBadGateway, "Content-Length: 0")
+		log.Printf("%s HTTP %s: %v", lease.Device, target.Host, err)
+		writeHTTP(client, http.StatusBadGateway)
 		return
 	}
 	defer upstream.Close()
@@ -274,7 +275,7 @@ func (p *Proxy) connectHTTP(ctx context.Context, client net.Conn, egress LeaseDi
 	upstream, err := egress.DialContext(ctx, host, port)
 	if err != nil {
 		log.Printf("CONNECT host=%s port=%d: %v", host, port, err)
-		writeHTTP(client, http.StatusBadGateway, "Content-Length: 0")
+		writeHTTP(client, http.StatusBadGateway)
 		return
 	}
 	defer upstream.Close()
@@ -285,8 +286,8 @@ func (p *Proxy) connectHTTP(ctx context.Context, client net.Conn, egress LeaseDi
 }
 
 func (p *Proxy) authenticationError(client net.Conn, err error) {
-	log.Printf("proxy authentication/session rejected: %v", err)
-	writeHTTP(client, http.StatusProxyAuthRequired, "Proxy-Authenticate: Basic realm=vpngate-proxy", "Content-Length: 0")
+	log.Printf("proxy request rejected: %v", err)
+	writeHTTP(client, http.StatusProxyAuthRequired, "Proxy-Authenticate: Basic realm=vpngate-proxy")
 }
 
 func proxyAuthority(authority string) (string, int, error) {

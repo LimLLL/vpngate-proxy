@@ -12,15 +12,16 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"time"
 
-	"github.com/LimLLL/vpngate-proxy/go_backend/gateway"
+	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
 func main() {
 	source := flag.String("source", "https://www.vpngate.net/api/iphone/", "VPNGate CSV endpoint")
 	fixture := flag.String("fixture", "", "use a prepared CSV rather than downloading")
-	fallback := flag.String("fallback", "mirror/vpngate.csv", "offline snapshot if the official endpoint fails")
+	fallback := flag.String("fallback", "nodes/testdata/vpngate.csv", "offline snapshot if the official endpoint fails")
 	output := flag.String("output", "candidate.ovpn", "validated native profile path")
 	snapshotOutput := flag.String("snapshot-output", "", "optional exact source CSV retention path")
 	device := flag.String("device", "tun0", "fixed client TUN interface")
@@ -48,20 +49,17 @@ func prepare(sourceURL, fixture, fallback, output, snapshotOutput, device string
 	if err != nil {
 		return err
 	}
-	source := &gateway.Source{}
-	if err := source.LoadSnapshot(data); err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	candidate, err := source.Next(ctx)
+	candidates, err := nodes.ParseCSV(data)
 	if err != nil {
 		return err
 	}
+	// Highest VPNGate score first, the same preference the registry uses.
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Score > candidates[j].Score })
+	candidate := candidates[0]
 	if err := os.MkdirAll(filepath.Dir(output), 0o700); err != nil {
 		return err
 	}
-	profile := gateway.PrepareProfile(candidate.Profile, device)
+	profile := nodes.PrepareProfile(candidate.Profile, device)
 	if err := os.WriteFile(output, []byte(profile), 0o600); err != nil {
 		return err
 	}
@@ -81,11 +79,13 @@ func prepare(sourceURL, fixture, fallback, output, snapshotOutput, device string
 }
 
 func download(source string) ([]byte, error) {
-	request, err := http.NewRequest(http.MethodGet, source, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
 		return nil, err
 	}
-	response, err := (&http.Client{Timeout: 20 * time.Second}).Do(request)
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return nil, err
 	}

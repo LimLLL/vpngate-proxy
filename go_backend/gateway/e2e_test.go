@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/LimLLL/vpngate-proxy/go_backend/nodes"
 )
 
 // TestControlledSessionGateway runs only when the isolated CI network has
@@ -26,20 +28,25 @@ func TestControlledSessionGateway(t *testing.T) {
 	if _, err := os.Stat("/dev/net/tun"); err != nil {
 		t.Fatal(err)
 	}
-	source, err := FileSource(pattern)
+	profiles, err := nodes.LoadProfiles(pattern)
 	if err != nil {
 		t.Fatal(err)
 	}
-	factory, err := NewNativeFactory(NativeConfig{Source: source, Timeout: 20 * time.Second, Backoff: 250 * time.Millisecond})
+	// Each profile has its own client certificate, so it stands in for a
+	// distinct node: the server hands every profile its own VPN address.
+	registry, err := nodes.OpenRegistry(nodes.RegistryConfig{MaxAge: time.Hour, MaxFailures: 3, Cooldown: time.Minute})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Merge(profiles, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool, err := NewPool(ctx, PoolConfig{
-		MinSpare: 2, MaxTunnels: 8, CreateAttempts: 3,
-		ConnectTimeout: 30 * time.Second, IdleTimeout: 10 * time.Minute,
-		Factory: factory.Factory(), Logf: t.Logf,
+		Nodes: registry, Connect: NativeConnector(0, 20*time.Second),
+		MaxTunnels: 8, MinIdle: 2, IdleTimeout: 10 * time.Minute,
+		ConnectTimeout: 20 * time.Second, ConnectAttempts: 3, Logf: t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +56,7 @@ func TestControlledSessionGateway(t *testing.T) {
 			t.Errorf("controlled pool close: %v", err)
 		}
 	}()
-	proxy, err := NewProxy(ctx, pool, "test-password", 64)
+	proxy, err := NewProxy(ctx, pool, "test", "test-password", 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +90,7 @@ func TestControlledSessionGateway(t *testing.T) {
 	}
 	device := func(session string) string {
 		t.Helper()
-		_, _, sessions := pool.Status()
-		for _, status := range sessions {
+		for _, status := range pool.Status().Sessions {
 			if status.ID == session {
 				return status.Device
 			}
@@ -92,8 +98,8 @@ func TestControlledSessionGateway(t *testing.T) {
 		return ""
 	}
 
-	first := request("session-alpha-t-1")
-	second := request("session-alpha-t-1")
+	first := request("test-session-alpha-t-1")
+	second := request("test-session-alpha-t-1")
 	if first != second {
 		t.Fatalf("session changed before expiration: %q %q", first, second)
 	}
@@ -101,11 +107,11 @@ func TestControlledSessionGateway(t *testing.T) {
 	if firstDevice == "" {
 		t.Fatal("alpha has no native TUN")
 	}
-	independentIP := request("session-beta-t-1")
+	independentIP := request("test-session-beta-t-1")
 	if independentIP == first || device("beta") == firstDevice {
 		t.Fatalf("session beta did not receive an independent TUN: %s", independentIP)
 	}
-	_ = request("session-holding-t-1")
+	_ = request("test-session-holding-t-1")
 	holdDevice := device("holding")
 	if holdDevice == "" || holdDevice == firstDevice {
 		t.Fatalf("holding stream has no independent endpoint: %s", holdDevice)
@@ -126,7 +132,7 @@ func TestControlledSessionGateway(t *testing.T) {
 	firstEcho := writePing()
 	t.Logf("wait 62 seconds for a complete one-minute session TTL while a CONNECT remains active")
 	time.Sleep(62 * time.Second)
-	rotatedIP := request("session-alpha-t-1")
+	rotatedIP := request("test-session-alpha-t-1")
 	rotatedDevice := device("alpha")
 	if rotatedDevice == "" || rotatedDevice == firstDevice {
 		t.Fatalf("TTL did not rotate the native TUN: %s -> %s", firstDevice, rotatedDevice)
@@ -172,7 +178,7 @@ func openHoldingCONNECT(t *testing.T, proxyAddress string) (net.Conn, *bufio.Rea
 	if err != nil {
 		t.Fatal(err)
 	}
-	credentials := base64.StdEncoding.EncodeToString([]byte("session-holding-t-1:test-password"))
+	credentials := base64.StdEncoding.EncodeToString([]byte("test-session-holding-t-1:test-password"))
 	request := fmt.Sprintf("CONNECT 10.66.0.1:18081 HTTP/1.1\r\nProxy-Authorization: Basic %s\r\n\r\n", credentials)
 	if _, err := io.WriteString(connection, request); err != nil {
 		t.Fatal(err)

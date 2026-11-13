@@ -91,7 +91,7 @@ jobs:
           go build -race -o "${RUNNER_TEMP}/vpngate-prepare" ./cmd/candidate
           "${RUNNER_TEMP}/vpngate-prepare" --output "${RUNNER_TEMP}/candidate.ovpn" \
             --snapshot-output "${RUNNER_TEMP}/vpngate-live.csv" --device tun0 \
-            --fallback "${GITHUB_WORKSPACE}/mirror/vpngate.csv"
+            --fallback "${GITHUB_WORKSPACE}/go_backend/nodes/testdata/vpngate.csv"
 
       - name: Evaluate the public profile and failed-connection cleanup
         if: inputs.live

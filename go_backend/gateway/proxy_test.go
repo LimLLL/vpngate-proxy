@@ -51,8 +51,8 @@ func (d *recordedDialer) ResolveIPv4(ctx context.Context, host string) ([]net.IP
 
 func testProxy(t *testing.T) *Proxy {
 	t.Helper()
-	pool := testPool(t, 0, 2, time.Minute)
-	proxy, err := NewProxy(context.Background(), pool, "secret", 8)
+	pool, _ := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{})
+	proxy, err := NewProxy(context.Background(), pool, "acct", "secret", 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,8 +60,28 @@ func testProxy(t *testing.T) *Proxy {
 	return proxy
 }
 
-func proxySessionAuth(session string) string {
-	return "Basic " + base64.StdEncoding.EncodeToString([]byte("session-"+session+":secret"))
+func proxyAuth(username string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":secret"))
+}
+
+// httpStatus sends one request line plus headers and returns the status code.
+func httpStatus(t *testing.T, proxy *Proxy, request string) int {
+	t.Helper()
+	client, server := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer server.Close()
+		proxy.handle(server)
+	}()
+	if _, err := io.WriteString(client, request); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	return response.StatusCode
 }
 
 func TestHTTPRejectsMissingProxyCredentials(t *testing.T) {
@@ -90,8 +110,8 @@ func TestCONNECTPreservesBufferedPayloadAndForwardsThroughLease(t *testing.T) {
 	proxy := testProxy(t)
 	dialer := &recordedDialer{received: make(chan []byte, 1), response: "server-response"}
 	proxy.DialerForLease = func(lease *Lease) (LeaseDialer, error) {
-		if lease.Session.ID != "work" || lease.Session.TTL != time.Minute {
-			return nil, fmt.Errorf("wrong session allocation: %+v", lease.Session)
+		if lease.Request.Session != "work" || lease.Request.TTL != time.Minute {
+			return nil, fmt.Errorf("wrong session allocation: %+v", lease.Request)
 		}
 		return dialer, nil
 	}
@@ -103,7 +123,7 @@ func TestCONNECTPreservesBufferedPayloadAndForwardsThroughLease(t *testing.T) {
 	}()
 	payload := "opaque-tls-payload"
 	request := "CONNECT example.com:443 HTTP/1.1\r\n" +
-		"Proxy-Authorization: " + proxySessionAuth("work-t-1") + "\r\n\r\n" + payload
+		"Proxy-Authorization: " + proxyAuth("acct-session-work-t-1") + "\r\n\r\n" + payload
 	if _, err := io.WriteString(client, request); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +162,7 @@ func TestHTTPStripsProxyCredentialsFromTargetRequest(t *testing.T) {
 		proxy.handle(server)
 	}()
 	request := "GET " + upstream.URL + "/path HTTP/1.1\r\nHost: " + strings.TrimPrefix(upstream.URL, "http://") +
-		"\r\nConnection: close\r\nProxy-Authorization: " + proxySessionAuth("work-t-1") +
+		"\r\nConnection: close\r\nProxy-Authorization: " + proxyAuth("acct-session-work-t-1") +
 		"\r\nAuthorization: AuthorizationIsNotProxyAuthentication\r\n\r\n"
 	if _, err := io.WriteString(client, request); err != nil {
 		t.Fatal(err)
@@ -171,9 +191,31 @@ func (plainDialer) ResolveIPv4(ctx context.Context, host string) ([]net.IP, erro
 	return []net.IP{net.ParseIP(host)}, nil
 }
 
+func TestHTTPStatusSeparatesRejectionFromShortage(t *testing.T) {
+	proxy := testProxy(t)
+	connect := func(username string) int {
+		return httpStatus(t, proxy, "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: "+proxyAuth(username)+"\r\n\r\n")
+	}
+	if status := connect("acct-country-kr"); status != http.StatusServiceUnavailable {
+		t.Fatalf("no KR node: want 503, got %d", status)
+	}
+	if status := connect("acct-session-bad-name"); status != http.StatusProxyAuthRequired {
+		t.Fatalf("malformed username: want 407, got %d", status)
+	}
+	proxy.DialerForLease = func(*Lease) (LeaseDialer, error) {
+		return &recordedDialer{received: make(chan []byte, 1), respondImmediately: true}, nil
+	}
+	if status := connect("acct-session-s-t-5"); status != http.StatusOK {
+		t.Fatalf("session start: want 200, got %d", status)
+	}
+	if status := connect("acct-session-s-t-6"); status != http.StatusProxyAuthRequired {
+		t.Fatalf("changed TTL on a live session: want 407, got %d", status)
+	}
+}
+
 func TestSOCKS5InvalidCredentials(t *testing.T) {
-	pool := testPool(t, 0, 1, time.Minute)
-	proxy, err := NewProxy(context.Background(), pool, "secret", 8)
+	pool, _ := newTestPool(t, testNodes(t, "JP"), poolOptions{})
+	proxy, err := NewProxy(context.Background(), pool, "acct", "secret", 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,8 +226,9 @@ func TestSOCKS5InvalidCredentials(t *testing.T) {
 		defer server.Close()
 		proxy.handle(server)
 	}()
-	request := []byte{5, 1, 2, 1, 16}
-	request = append(request, []byte("session-work-t-1")...)
+	username := []byte("acct-session-work-t-1")
+	request := []byte{5, 1, 2, 1, byte(len(username))}
+	request = append(request, username...)
 	request = append(request, 5)
 	request = append(request, []byte("wrong")...)
 	writing := make(chan error, 1)
@@ -200,11 +243,28 @@ func TestSOCKS5InvalidCredentials(t *testing.T) {
 	if reply[0] != 5 || reply[1] != 2 || reply[2] != 1 || reply[3] == 0 {
 		t.Fatalf("invalid authentication response: %v", reply)
 	}
-	count, _, sessions := pool.Status()
-	if count != 0 || len(sessions) != 0 {
-		t.Fatalf("failed authentication opened a tunnel: %+v", sessions)
+	if status := pool.Status(); len(status.Tunnels) != 0 || len(status.Sessions) != 0 {
+		t.Fatalf("failed authentication opened a tunnel: %+v", status)
 	}
 	if err := <-writing; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCredentialAndAuthorityParsing(t *testing.T) {
+	user, password, err := proxyBasicCredentials("Basic " + base64.StdEncoding.EncodeToString([]byte("acct-session-app:sec:ret")))
+	if err != nil || user != "acct-session-app" || password != "sec:ret" {
+		t.Fatalf("unexpected proxy credentials %q %q %v", user, password, err)
+	}
+	if _, _, err := proxyBasicCredentials("Basic bm9jb2xvbg=="); err == nil {
+		t.Fatal("missing colon unexpectedly authenticated")
+	}
+	host, port, err := proxyAuthority("example.com:8443")
+	if err != nil || host != "example.com" || port != 8443 {
+		t.Fatalf("unexpected target %s %d %v", host, port, err)
+	}
+	host, port, err = proxyAuthority("[2001:db8::1]:443")
+	if err != nil || host != "2001:db8::1" || port != 443 {
+		t.Fatalf("IPv6 target parsed incorrectly: %s %d %v", host, port, err)
 	}
 }

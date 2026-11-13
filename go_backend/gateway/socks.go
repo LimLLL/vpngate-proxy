@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net"
-
 	"time"
 )
 
@@ -65,14 +64,19 @@ func (p *Proxy) handleSocks(client net.Conn, reader *bufio.Reader) {
 	defer cancel()
 	lease, egress, err := p.acquireTunnel(ctx, username, password)
 	if err != nil {
-		log.Printf("SOCKS5 authentication or session error: %v", err)
-		writeSocksReply(client, 1)
+		log.Printf("SOCKS5 %q: %v", username, err)
+		// 0x02 "not allowed by ruleset" for client errors, 0x01 general failure otherwise.
+		code := byte(1)
+		if rejected(err) {
+			code = 2
+		}
+		writeSocksReply(client, code)
 		return
 	}
 	defer lease.Release()
 	upstream, err := egress.DialContext(ctx, host, port)
 	if err != nil {
-		log.Printf("%s SOCKS5 %s:%d: %v", lease.Info.TUNName, host, port, err)
+		log.Printf("%s SOCKS5 %s:%d: %v", lease.Device, host, port, err)
 		writeSocksReply(client, 4)
 		return
 	}
