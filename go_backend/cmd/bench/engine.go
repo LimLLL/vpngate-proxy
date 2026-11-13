@@ -121,7 +121,7 @@ func (e cliEngine) Connect(ctx context.Context, profile, device string) (tunnel,
 	case <-ctx.Done():
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return nil, errors.Join(ctx.Err(), t.Close(closeCtx))
+		return nil, errors.Join(fmt.Errorf("%w; last output: %s", ctx.Err(), t.tail()), t.Close(closeCtx))
 	}
 }
 

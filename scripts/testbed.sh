@@ -28,13 +28,16 @@ testbed_init() {
     -keyout "${private}/server.key" -out "${TB_WORK}/server.csr"
   openssl x509 -req -in "${TB_WORK}/server.csr" -days 1 \
     -CA "${private}/ca.crt" -CAkey "${private}/ca.key" -CAcreateserial \
-    -extfile <(printf 'extendedKeyUsage=serverAuth\nsubjectAltName=IP:%s\n' "${TB_SERVER_IP}") \
+    -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:%s\n' "${TB_SERVER_IP}") \
     -out "${private}/server.crt"
-  # One client certificate for every tunnel; the server sets duplicate-cn.
+  # The OpenVPN 2.x client's remote-cert-tls checks keyUsage as well as the
+  # extended usage; OpenVPN 3 Core accepts the certificate without it.
+  # One client certificate serves every tunnel; the server sets duplicate-cn.
   openssl req -newkey rsa:2048 -nodes -subj '/CN=vpngate-test-client' \
     -keyout "${private}/client.key" -out "${TB_WORK}/client.csr"
   openssl x509 -req -in "${TB_WORK}/client.csr" -days 1 \
     -CA "${private}/ca.crt" -CAkey "${private}/ca.key" -CAcreateserial \
+    -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n') \
     -out "${private}/client.crt"
   openvpn --genkey secret "${private}/tls.key"
 
