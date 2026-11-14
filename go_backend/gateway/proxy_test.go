@@ -10,8 +10,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -258,6 +260,57 @@ func TestTimedOutDialThroughAWorkingTunnelIsABadGateway(t *testing.T) {
 	}
 	if network.endpoint("10.0.0.1").isClosed() {
 		t.Fatal("a working tunnel was dropped")
+	}
+}
+
+// failingDialer fails every dial with err.
+type failingDialer struct{ err error }
+
+func (d failingDialer) DialContext(context.Context, string, int) (net.Conn, error) { return nil, d.err }
+func (failingDialer) ResolveIPv4(context.Context, string) ([]net.IP, error) {
+	return nil, errors.New("not used")
+}
+
+func TestDialOnADroppedTunnelMovesToAnotherOne(t *testing.T) {
+	pool, network := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{egress: distinctEgress})
+	proxy, err := NewProxy(context.Background(), pool, "acct", "secret", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+	proxy.DialerForLease = func(lease *Lease) (LeaseDialer, error) {
+		if lease.NodeID == "10.0.0.1" {
+			// Core restarted and took the TUN with it: no timeout, just gone.
+			network.kill(lease.NodeID)
+			network.endpoint(lease.NodeID).drop()
+			return failingDialer{&net.OpError{Op: "dial", Net: "udp", Err: os.NewSyscallError("setsockopt", syscall.ENODEV)}}, nil
+		}
+		return &recordedDialer{received: make(chan []byte, 1), respondImmediately: true}, nil
+	}
+	request := "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: " + proxyAuth("acct-session-s") + "\r\n\r\n"
+	if status := httpStatus(t, proxy, request); status != http.StatusOK {
+		t.Fatalf("the request should have moved to a working tunnel, got %d", status)
+	}
+}
+
+func TestRefusedDialKeepsTheTunnel(t *testing.T) {
+	pool, network := newTestPool(t, testNodes(t, "JP", "JP"), poolOptions{egress: distinctEgress})
+	proxy, err := NewProxy(context.Background(), pool, "acct", "secret", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+	proxy.DialerForLease = func(lease *Lease) (LeaseDialer, error) {
+		// Were the tunnel probed now, it would fail; a refusal proves it works.
+		network.kill(lease.NodeID)
+		return failingDialer{&net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}}, nil
+	}
+	request := "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: " + proxyAuth("acct-session-s") + "\r\n\r\n"
+	if status := httpStatus(t, proxy, request); status != http.StatusBadGateway {
+		t.Fatalf("a refused target: want 502, got %d", status)
+	}
+	if network.endpoint("10.0.0.1").isClosed() {
+		t.Fatal("a refusal from the target dropped the tunnel")
 	}
 }
 

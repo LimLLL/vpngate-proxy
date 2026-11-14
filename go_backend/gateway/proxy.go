@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -164,9 +165,10 @@ func (e dialError) Error() string { return e.err.Error() }
 func (e dialError) Unwrap() error { return e.err }
 
 // dial acquires a tunnel for request and connects to host:port through it.
-// When the dial times out, the tunnel is checked; if it no longer carries
-// traffic it is dropped, and the dial is retried once on another tunnel
-// before the client hears of it.
+// Unless the failure came back from the far side, which proves the tunnel
+// works, the tunnel is checked; if it was dropped meanwhile or no longer
+// carries traffic, the dial is retried once on another tunnel before the
+// client hears of it.
 func (p *Proxy) dial(ctx context.Context, request Request, host string, port int) (*Lease, net.Conn, error) {
 	for retried := false; ; retried = true {
 		lease, err := p.pool.Acquire(ctx, request)
@@ -185,20 +187,21 @@ func (p *Proxy) dial(ctx context.Context, request Request, host string, port int
 			lease.ReportSuccess()
 			return lease, upstream, nil
 		}
-		dead := timedOut(err) && ctx.Err() == nil && !lease.Recheck(ctx)
+		dead := ctx.Err() == nil && !answered(err) && !lease.Recheck(ctx)
 		lease.Release()
 		if !dead || retried {
-			return nil, nil, dialError{fmt.Errorf("%s: %w", lease.Device, err)}
+			return nil, nil, dialError{fmt.Errorf("%s via %s: %w", lease.Device, lease.NodeID, err)}
 		}
-		log.Printf("%s carries no traffic (%v); retrying %s:%d on another tunnel", lease.Device, err, host, port)
+		log.Printf("%s via %s carries no traffic (%v); retrying %s:%d on another tunnel",
+			lease.Device, lease.NodeID, err, host, port)
 	}
 }
 
-// timedOut covers DNS and connect timeouts, which is how a tunnel that
-// silently stopped forwarding shows itself.
-func timedOut(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout() || errors.Is(err, context.DeadlineExceeded)
+// answered reports whether a dial failed on an answer from the far side: the
+// target refused, or DNS said the name does not exist.
+func answered(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
 
 // rejected reports whether err is the client's fault (407) rather than a

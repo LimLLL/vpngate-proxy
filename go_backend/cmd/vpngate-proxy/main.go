@@ -24,6 +24,11 @@ const (
 	refreshInterval = 20 * time.Minute
 	retryInterval   = time.Minute
 	connectTimeout  = 15 * time.Second
+	// Every node is checked this often with a bare OpenVPN handshake, which
+	// costs it two small packets; only nodes that answered get connected.
+	livenessInterval = 5 * time.Minute
+	livenessTimeout  = 4 * time.Second
+	livenessWorkers  = 32
 )
 
 func main() {
@@ -58,6 +63,7 @@ func run(dataDir string, printOnly bool) error {
 		MaxAge:      time.Duration(config.NodeMaxAgeDays) * 24 * time.Hour,
 		MaxFailures: config.NodeMaxFailures,
 		Cooldown:    10 * time.Minute,
+		Unreachable: 24 * time.Hour,
 	})
 	if err != nil {
 		return err
@@ -65,6 +71,9 @@ func run(dataDir string, printOnly bool) error {
 	// The default transport honors HTTPS_PROXY/HTTP_PROXY for the listing.
 	client := &http.Client{Timeout: time.Minute}
 	refreshed := refresh(ctx, registry, client, config.APIURLs)
+	// Serve only once every node has been checked, so the first requests do
+	// not wait on nodes that went offline.
+	checkLiveness(ctx, registry, false)
 
 	pool, err := gateway.NewPool(ctx, gateway.PoolConfig{
 		Nodes:           registry,
@@ -90,6 +99,7 @@ func run(dataDir string, printOnly bool) error {
 		listener.Addr(), config.Username, registry.Len())
 
 	go refreshLoop(ctx, registry, client, config.APIURLs, refreshed)
+	go livenessLoop(ctx, registry)
 	served := make(chan error, 1)
 	go func() { served <- proxy.Serve(listener) }()
 	select {
@@ -135,6 +145,8 @@ func refresh(ctx context.Context, registry *nodes.Registry, client *http.Client,
 	return true
 }
 
+// refreshLoop also checks the nodes each listing added, so they become usable
+// without waiting for the next full round.
 func refreshLoop(ctx context.Context, registry *nodes.Registry, client *http.Client, urls []string, ok bool) {
 	for {
 		wait := refreshInterval
@@ -146,8 +158,43 @@ func refreshLoop(ctx context.Context, registry *nodes.Registry, client *http.Cli
 			return
 		case <-time.After(wait):
 		}
-		ok = refresh(ctx, registry, client, urls)
+		if ok = refresh(ctx, registry, client, urls); ok {
+			checkLiveness(ctx, registry, true)
+		}
 	}
+}
+
+func livenessLoop(ctx context.Context, registry *nodes.Registry) {
+	ticker := time.NewTicker(livenessInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkLiveness(ctx, registry, false)
+		}
+	}
+}
+
+// checkLiveness checks every node, or with onlyNew those never checked, and
+// saves the results so a restart can serve before its first round ends.
+func checkLiveness(ctx context.Context, registry *nodes.Registry, onlyNew bool) {
+	started := time.Now()
+	alive, total := registry.Probe(ctx, handshake, onlyNew, livenessWorkers)
+	if total == 0 {
+		return
+	}
+	log.Printf("liveness: %d of %d nodes answer (%s)", alive, total, time.Since(started).Round(time.Second))
+	if err := registry.Save(); err != nil {
+		log.Printf("save node table: %v", err)
+	}
+}
+
+func handshake(ctx context.Context, node nodes.Candidate) error {
+	ctx, cancel := context.WithTimeout(ctx, livenessTimeout)
+	defer cancel()
+	return nodes.Handshake(ctx, node.RemoteHost, node.RemotePort, node.Protocol)
 }
 
 func printCredentials(config Config) error {

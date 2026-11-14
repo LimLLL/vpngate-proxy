@@ -1,6 +1,8 @@
 package nodes
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -8,11 +10,20 @@ import (
 
 func testRegistry(t *testing.T, path string) *Registry {
 	t.Helper()
-	registry, err := OpenRegistry(RegistryConfig{Path: path, MaxAge: 7 * 24 * time.Hour, MaxFailures: 3, Cooldown: 10 * time.Minute})
+	registry, err := OpenRegistry(RegistryConfig{Path: path, MaxAge: 7 * 24 * time.Hour, MaxFailures: 3,
+		Cooldown: 10 * time.Minute, Unreachable: 24 * time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return registry
+}
+
+// merge adds a listing whose nodes all answered a liveness check.
+func merge(registry *Registry, now time.Time, listing ...Candidate) {
+	registry.Merge(listing, now)
+	for _, candidate := range listing {
+		registry.ReportProbe(candidate.ID, true, now)
+	}
 }
 
 func node(id, country string, score int) Candidate {
@@ -58,6 +69,9 @@ func TestRegistryAccumulatesAndEvictsByAge(t *testing.T) {
 	if added, _ := registry.Merge([]Candidate{updated, node("c", "JP", 1)}, start.Add(time.Hour)); added != 1 {
 		t.Fatalf("added %d, want 1", added)
 	}
+	for _, id := range []string{"a", "b", "c"} {
+		registry.ReportProbe(id, true, start.Add(time.Hour))
+	}
 	if registry.Len() != 3 {
 		t.Fatalf("absent node b should be kept, have %d nodes", registry.Len())
 	}
@@ -73,19 +87,61 @@ func TestRegistryAccumulatesAndEvictsByAge(t *testing.T) {
 	}
 }
 
-func TestRegistryPrefersListedThenRecentlySuccessful(t *testing.T) {
+func TestRegistryPrefersScoreThenRecentSuccess(t *testing.T) {
 	registry := testRegistry(t, "")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	registry.Merge([]Candidate{node("old-ok", "JP", 1), node("old-never", "JP", 99)}, now)
-	registry.ReportSuccess("old-ok", "", now)
-	registry.Merge([]Candidate{node("low", "JP", 10), node("high", "JP", 20)}, now.Add(time.Minute))
+	merge(registry, now, node("low", "JP", 10), node("high", "JP", 20), node("low-ok", "JP", 10))
+	registry.ReportSuccess("low-ok", "", now)
 	// Every node is its own network here, so the order is the fallback one.
-	if got, want := picks(registry, Filter{}, now.Add(time.Minute)), []string{"high", "low", "old-ok", "old-never"}; !equal(got, want) {
+	if got, want := picks(registry, Filter{}, now.Add(time.Minute)), []string{"high", "low-ok", "low"}; !equal(got, want) {
 		t.Fatalf("order %v, want %v", got, want)
 	}
 	excluded := picks(registry, Filter{Exclude: func(n Node) bool { return n.ID == "high" }}, now.Add(time.Minute))
-	if len(excluded) != 3 || excluded[0] == "high" || excluded[1] == "high" || excluded[2] == "high" {
+	if len(excluded) != 2 || excluded[0] == "high" || excluded[1] == "high" {
 		t.Fatalf("exclude ignored: %v", excluded)
+	}
+}
+
+func TestRegistryPicksOnlyNodesThatAnswered(t *testing.T) {
+	registry := testRegistry(t, "")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	registry.Merge([]Candidate{node("up", "JP", 1), node("new", "JP", 99), node("down", "JP", 50)}, now)
+	registry.ReportProbe("up", true, now)
+	registry.ReportProbe("down", false, now)
+	if got := picks(registry, Filter{}, now); !equal(got, []string{"up"}) {
+		t.Fatalf("picked %v; unchecked and unreachable nodes must wait", got)
+	}
+	registry.ReportProbe("up", false, now.Add(time.Hour))
+	if _, ok := registry.Next(Filter{}, now.Add(time.Hour)); ok {
+		t.Fatal("a node that stopped answering was still picked")
+	}
+	// Silent for over a day since it last answered, or since it was listed.
+	registry.ReportProbe("up", false, now.Add(25*time.Hour))
+	registry.ReportProbe("down", false, now.Add(25*time.Hour))
+	if _, ok := registry.Get("up"); ok || registry.Len() != 1 {
+		t.Fatalf("long unreachable nodes should be dropped, %d left", registry.Len())
+	}
+}
+
+func TestRegistryProbe(t *testing.T) {
+	registry := testRegistry(t, "")
+	now := time.Now()
+	registry.Merge([]Candidate{node("a", "JP", 1), node("b", "JP", 1), node("c", "JP", 1)}, now)
+	check := func(_ context.Context, candidate Candidate) error {
+		if candidate.ID == "b" {
+			return errors.New("no answer")
+		}
+		return nil
+	}
+	if alive, total := registry.Probe(context.Background(), check, false, 2); alive != 2 || total != 3 {
+		t.Fatalf("probe found %d of %d alive, want 2 of 3", alive, total)
+	}
+	if b, _ := registry.Get("b"); b.Reachable || b.ProbedAt.IsZero() {
+		t.Fatalf("b's failed check was not recorded: %+v", b)
+	}
+	registry.Merge([]Candidate{node("d", "JP", 1)}, now)
+	if _, total := registry.Probe(context.Background(), check, true, 2); total != 1 {
+		t.Fatalf("checking new nodes covered %d, want only d", total)
 	}
 }
 
@@ -93,10 +149,9 @@ func TestRegistryRotatesAcrossNetworks(t *testing.T) {
 	registry := testRegistry(t, "")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	// Two academic servers behind one NAT outscore two home nodes.
-	registry.Merge([]Candidate{
+	merge(registry, now,
 		node("219.100.37.1", "JP", 100), node("219.100.37.2", "JP", 90),
-		node("106.168.67.207", "JP", 50), node("118.104.101.56", "JP", 40),
-	}, now)
+		node("106.168.67.207", "JP", 50), node("118.104.101.56", "JP", 40))
 	egress := map[string]string{
 		"219.100.37.1": "219.100.37.240", "219.100.37.2": "219.100.37.245",
 		"106.168.67.207": "106.168.67.207", "118.104.101.56": "118.104.101.56",
@@ -121,7 +176,7 @@ func TestRegistryRotatesAcrossNetworks(t *testing.T) {
 func TestRegistryMovesToAnotherNetworkAfterAFailure(t *testing.T) {
 	registry := testRegistry(t, "")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	registry.Merge([]Candidate{node("219.100.37.1", "JP", 100), node("219.100.37.2", "JP", 90), node("106.168.67.207", "JP", 50)}, now)
+	merge(registry, now, node("219.100.37.1", "JP", 100), node("219.100.37.2", "JP", 90), node("106.168.67.207", "JP", 50))
 	first, _ := registry.Next(Filter{}, now)
 	registry.ReportFailure(first.ID, now)
 	// A full academic server says nothing good about its busy neighbours.
@@ -133,7 +188,7 @@ func TestRegistryMovesToAnotherNetworkAfterAFailure(t *testing.T) {
 func TestRegistryCooldownAndFailureLimit(t *testing.T) {
 	registry := testRegistry(t, "")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	registry.Merge([]Candidate{node("a", "JP", 1)}, now)
+	merge(registry, now, node("a", "JP", 1))
 	registry.ReportFailure("a", now)
 	if _, ok := registry.Next(Filter{}, now.Add(time.Minute)); ok {
 		t.Fatal("a failed node must cool down")
@@ -157,7 +212,7 @@ func TestRegistryPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nodes.json")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	registry := testRegistry(t, path)
-	registry.Merge([]Candidate{node("a", "JP", 1), node("198.51.100.2", "US", 3), node("203.0.113.3", "US", 2)}, now)
+	merge(registry, now, node("a", "JP", 1), node("198.51.100.2", "US", 3), node("203.0.113.3", "US", 2))
 	registry.ReportFailure("a", now)
 	registry.ReportSuccess("198.51.100.2", "198.51.100.2", now)
 	if err := registry.Save(); err != nil {

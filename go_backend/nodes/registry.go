@@ -20,6 +20,11 @@ type Node struct {
 	FirstSeen   time.Time `json:"first_seen"`
 	LastSeen    time.Time `json:"last_seen"`
 	LastSuccess time.Time `json:"last_success"`
+	// Reachable is the outcome of the latest liveness check at ProbedAt;
+	// only reachable nodes are picked.
+	Reachable     bool      `json:"reachable"`
+	ProbedAt      time.Time `json:"probed_at"`
+	LastReachable time.Time `json:"last_reachable"`
 	// Failures counts consecutive failed connects; a success resets it.
 	Failures   int       `json:"failures"`
 	RetryAfter time.Time `json:"retry_after"`
@@ -34,11 +39,16 @@ type RegistryConfig struct {
 	MaxFailures int
 	// Cooldown skips a node for this long after each failed connect.
 	Cooldown time.Duration
+	// Unreachable drops a node that has failed every liveness check for
+	// this long; zero keeps such nodes.
+	Unreachable time.Duration
 }
 
 // Registry accumulates every node seen in VPNGate listings, because each
-// listing only shows the servers online at that moment and IP variety is the
-// point of the proxy. Nodes leave by age or by repeated connect failures.
+// listing only shows some of the servers online at that moment and IP
+// variety is the point of the proxy. Liveness checks tell which of them still
+// answer. Nodes leave by age, by staying unreachable or by repeated connect
+// failures.
 type Registry struct {
 	config RegistryConfig
 	saveMu sync.Mutex
@@ -46,19 +56,16 @@ type Registry struct {
 	mu    sync.Mutex
 	nodes map[string]*Node
 	usage usage // what Next rotates by; persisted with the nodes
-	// listed is when the latest listing was merged; nodes seen then are in it.
-	listed time.Time
 }
 
 type registryFile struct {
-	ListedAt time.Time `json:"listed_at"`
-	Usage    usage     `json:"usage"`
-	Nodes    []Node    `json:"nodes"`
+	Usage usage  `json:"usage"`
+	Nodes []Node `json:"nodes"`
 }
 
 // OpenRegistry loads the table from config.Path when the file exists.
 func OpenRegistry(config RegistryConfig) (*Registry, error) {
-	if config.MaxAge <= 0 || config.MaxFailures < 1 || config.Cooldown < 0 {
+	if config.MaxAge <= 0 || config.MaxFailures < 1 || config.Cooldown < 0 || config.Unreachable < 0 {
 		return nil, errors.New("registry needs a positive max age and failure limit")
 	}
 	r := &Registry{config: config, nodes: make(map[string]*Node), usage: newUsage()}
@@ -81,12 +88,12 @@ func OpenRegistry(config RegistryConfig) (*Registry, error) {
 		r.nodes[node.ID] = &node
 	}
 	r.usage.merge(file.Usage)
-	r.listed = file.ListedAt
 	return r, nil
 }
 
-// Merge records a fresh listing and saves the table. Being listed does not
-// reset failure counts: it shows the server registered, not that it connects.
+// Merge records a fresh listing and saves the table. New nodes are picked
+// only once a liveness check reached them. Being listed does not reset
+// failure counts: it shows the server registered, not that it connects.
 func (r *Registry) Merge(listing []Candidate, now time.Time) (added int, err error) {
 	r.mu.Lock()
 	for _, candidate := range listing {
@@ -98,7 +105,6 @@ func (r *Registry) Merge(listing []Candidate, now time.Time) (added int, err err
 		r.nodes[candidate.ID] = &Node{Candidate: candidate, FirstSeen: now, LastSeen: now}
 		added++
 	}
-	r.listed = now
 	for id, node := range r.nodes {
 		if now.Sub(node.LastSeen) > r.config.MaxAge {
 			delete(r.nodes, id)
@@ -130,6 +136,29 @@ func (r *Registry) ReportUsed(egress string, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.usage.markIP(egress, now)
+}
+
+// ReportProbe records a liveness check, dropping a node that has not answered
+// one for longer than the configured limit.
+func (r *Registry) ReportProbe(id string, reachable bool, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	node, ok := r.nodes[id]
+	if !ok {
+		return
+	}
+	node.Reachable, node.ProbedAt = reachable, now
+	if reachable {
+		node.LastReachable = now
+		return
+	}
+	since := node.LastReachable
+	if since.IsZero() {
+		since = node.FirstSeen
+	}
+	if r.config.Unreachable > 0 && now.Sub(since) > r.config.Unreachable {
+		delete(r.nodes, id)
+	}
 }
 
 // ReportFailure puts the node on cooldown, or drops it at the failure limit.
@@ -173,7 +202,7 @@ func (r *Registry) Save() error {
 	r.saveMu.Lock()
 	defer r.saveMu.Unlock()
 	r.mu.Lock()
-	file := registryFile{ListedAt: r.listed, Usage: newUsage(), Nodes: make([]Node, 0, len(r.nodes))}
+	file := registryFile{Usage: newUsage(), Nodes: make([]Node, 0, len(r.nodes))}
 	for _, node := range r.nodes {
 		file.Nodes = append(file.Nodes, *node)
 	}

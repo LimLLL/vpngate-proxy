@@ -159,22 +159,35 @@ func LoadProfiles(pattern string) ([]Candidate, error) {
 	return result, nil
 }
 
+// parseRemote reads the first remote and its transport. As in OpenVPN, a
+// protocol on the remote line wins over the proto directive, which is where
+// VPNGate profiles put it. Any tcp variant counts as tcp.
 func parseRemote(profile, fallback string) (host, port, protocol string) {
 	host, port, protocol = fallback, "1194", "udp"
+	remoteProtocol, found := "", false
 	for _, line := range strings.Split(profile, "\n") {
 		parts := strings.Fields(line)
-		if len(parts) > 1 && parts[0] == "remote" {
+		switch {
+		case len(parts) > 1 && parts[0] == "proto":
+			protocol = parts[1]
+		case len(parts) > 1 && parts[0] == "remote" && !found:
+			found = true
 			host = parts[1]
 			if len(parts) > 2 {
 				port = parts[2]
 			}
 			if len(parts) > 3 {
-				protocol = strings.ToLower(parts[3])
+				remoteProtocol = parts[3]
 			}
-			break
 		}
 	}
-	return host, port, protocol
+	if remoteProtocol != "" {
+		protocol = remoteProtocol
+	}
+	if strings.HasPrefix(strings.ToLower(protocol), "tcp") {
+		return host, port, "tcp"
+	}
+	return host, port, "udp"
 }
 
 func digits(value string) bool {

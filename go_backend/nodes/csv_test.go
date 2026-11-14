@@ -62,6 +62,10 @@ func TestParseCSV(t *testing.T) {
 	if second.Ping != 999999 || second.RemoteHost != "192.0.2.10" || second.RemotePort != "443" || second.Protocol != "udp" {
 		t.Fatalf("unexpected second candidate: %+v", second)
 	}
+	tcp, err := ParseCSV(testListing(testRow("t", "192.0.2.15", "JP", "1", "1", strings.Replace(testProfile(""), "proto udp", "proto tcp-client", 1))))
+	if err != nil || tcp[0].Protocol != "tcp" {
+		t.Fatalf("the proto directive was ignored: %+v %v", tcp, err)
+	}
 	if _, err := ParseCSV(testListing(testRow("x", "192.0.2.14", "JP", "1", "1", "client\n"))); err == nil {
 		t.Fatal("a listing without usable profiles was accepted")
 	}

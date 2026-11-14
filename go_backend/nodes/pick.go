@@ -15,20 +15,21 @@ type Filter struct {
 
 // Next returns the node to connect next and marks its network as used, so
 // concurrent picks, and the pick after a failed connect, move on to another
-// network. Among usable nodes it prefers, in order:
+// network. Usable nodes answered their latest liveness check and are not
+// cooling down; among them it prefers, in order:
 //
 //  1. the /24 network used least recently, so consecutive connections leave
 //     from unrelated addresses even where many nodes share one NAT;
 //  2. within it, the egress IP used least recently, a node not yet measured
 //     counting as never used;
-//  3. nodes in the latest listing, by VPNGate score;
-//  4. older nodes, by their last successful connect.
+//  3. the higher VPNGate score;
+//  4. the more recent successful connect.
 func (r *Registry) Next(filter Filter, now time.Time) (Node, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var best *Node
 	for _, node := range r.nodes {
-		if filter.Country != "" && node.Country != filter.Country || now.Before(node.RetryAfter) {
+		if !node.Reachable || filter.Country != "" && node.Country != filter.Country || now.Before(node.RetryAfter) {
 			continue
 		}
 		if filter.Exclude != nil && filter.Exclude(*node) {
@@ -52,18 +53,11 @@ func (r *Registry) before(a, b *Node) bool {
 	if x, y := r.usage.IPs[a.Egress], r.usage.IPs[b.Egress]; !x.Equal(y) {
 		return x.Before(y)
 	}
-	listedA, listedB := !a.LastSeen.Before(r.listed), !b.LastSeen.Before(r.listed)
-	if listedA != listedB {
-		return listedA
-	}
-	if listedA && a.Score != b.Score {
+	if a.Score != b.Score {
 		return a.Score > b.Score
 	}
 	if !a.LastSuccess.Equal(b.LastSuccess) {
 		return a.LastSuccess.After(b.LastSuccess)
-	}
-	if !a.LastSeen.Equal(b.LastSeen) {
-		return a.LastSeen.After(b.LastSeen)
 	}
 	return a.ID < b.ID
 }

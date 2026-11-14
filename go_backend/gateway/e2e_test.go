@@ -41,6 +41,11 @@ func TestControlledSessionGateway(t *testing.T) {
 	if _, err := registry.Merge(profiles, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	// The testbed server uses tls-crypt, which a bare handshake check cannot
+	// pass, so the profiles are marked reachable directly.
+	for _, profile := range profiles {
+		registry.ReportProbe(profile.ID, true, time.Now())
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool, err := NewPool(ctx, PoolConfig{
