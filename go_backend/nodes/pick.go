@@ -15,27 +15,28 @@ type Filter struct {
 
 // Next returns the node to connect next and marks its network as used, so
 // concurrent picks, and the pick after a failed connect, move on to another
-// network. Usable nodes answered their latest liveness check and are not
-// cooling down; among them it prefers, in order:
+// network. Among nodes not cooling down it prefers, in order:
 //
-//  1. the /24 network used least recently, so consecutive connections leave
+//  1. nodes listed or connected within the Fresh window, since accumulated
+//     nodes absent from listings for long are often offline;
+//  2. the /24 network used least recently, so consecutive connections leave
 //     from unrelated addresses even where many nodes share one NAT;
-//  2. within it, the egress IP used least recently, a node not yet measured
+//  3. within it, the egress IP used least recently, a node not yet measured
 //     counting as never used;
-//  3. the higher VPNGate score;
-//  4. the more recent successful connect.
+//  4. the higher VPNGate score;
+//  5. the more recent successful connect.
 func (r *Registry) Next(filter Filter, now time.Time) (Node, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var best *Node
 	for _, node := range r.nodes {
-		if !node.Reachable || filter.Country != "" && node.Country != filter.Country || now.Before(node.RetryAfter) {
+		if filter.Country != "" && node.Country != filter.Country || now.Before(node.RetryAfter) {
 			continue
 		}
 		if filter.Exclude != nil && filter.Exclude(*node) {
 			continue
 		}
-		if best == nil || r.before(node, best) {
+		if best == nil || r.before(node, best, now) {
 			best = node
 		}
 	}
@@ -46,7 +47,10 @@ func (r *Registry) Next(filter Filter, now time.Time) (Node, bool) {
 	return *best, true
 }
 
-func (r *Registry) before(a, b *Node) bool {
+func (r *Registry) before(a, b *Node, now time.Time) bool {
+	if freshA, freshB := r.fresh(a, now), r.fresh(b, now); freshA != freshB {
+		return freshA
+	}
 	if x, y := r.usage.Networks[a.network()], r.usage.Networks[b.network()]; !x.Equal(y) {
 		return x.Before(y)
 	}
@@ -60,6 +64,14 @@ func (r *Registry) before(a, b *Node) bool {
 		return a.LastSuccess.After(b.LastSuccess)
 	}
 	return a.ID < b.ID
+}
+
+func (r *Registry) fresh(n *Node, now time.Time) bool {
+	vouched := n.LastSeen
+	if n.LastSuccess.After(vouched) {
+		vouched = n.LastSuccess
+	}
+	return r.config.Fresh == 0 || now.Sub(vouched) <= r.config.Fresh
 }
 
 // network is where the node's traffic leaves from: its measured egress or,

@@ -15,7 +15,7 @@ socks5://同上
 | `user-session-abc-t-60` | 同一出口 IP 粘滞 60 分钟（`t` 为 1–1440，默认 10），到期换到实测出口不同的节点 |
 | `user-country-jp-session-abc` | 日本节点，粘滞 10 分钟 |
 
-隧道按需建立，不预热：每个轮换连接和每个会话的第一个连接都要先连上 VPNGate 节点（通常 2–8 秒，遇到坏节点会换下一个重试），会话在有效期内的后续连接直接复用。启动时和此后每 5 分钟，会给节点表里的全部节点各发一个 OpenVPN 握手包测活，只连最近一次有回应的节点。经隧道的 DNS 或连接超时会触发出口探测，隧道已失效就下线并换一条重试；会话隧道空闲时每分钟探测一次。
+隧道按需建立，不预热：每个轮换连接和每个会话的第一个连接都要先连上 VPNGate 节点（通常 2–8 秒，遇到坏节点会换下一个重试），会话在有效期内的后续连接直接复用。尽量用会话（`t` ≥ 10）：VPN Gate 会把向很多节点发起极短连接的 IP 当成审查机构的探测者并忽略它，不带 session 的轮换请求每个连接都是一次极短连接，大量使用有这个风险。经隧道的 DNS 或连接超时会触发出口探测，隧道已失效就下线并换一条重试；会话隧道空闲时每分钟探测一次。
 
 ## 部署（Docker）
 
@@ -50,8 +50,8 @@ curl -x "socks5h://<账号>-country-jp:<密码>@<服务器IP>:7928" https://api.
 
 - 升级：`docker compose pull && docker compose up -d`。`latest` 跟随 main 上测试通过的最新提交；也可以把镜像标签改成固定的 `sha-<提交前7位>` 或版本号。
 - 改账号、密码、隧道数量：编辑 `./data/config.json` 后 `docker compose restart`；或者在 `compose.yaml` 里用 `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` 覆盖。
-- `./data/nodes.json` 是累计的节点表，也记着每个节点的测活结果和实测过的出口 IP；删掉后会从下一次 VPNGate 列表重新积累。日志里的 `liveness: X of Y nodes answer` 是每轮测活的结果。
-- 服务器访问不了 `www.vpngate.net` 时，在 `compose.yaml` 的 `environment` 里加 `HTTPS_PROXY`（只用于拉节点列表）。
+- `./data/nodes.json` 是累计的节点表，也记着每个节点实测过的出口 IP；删掉后会从下一次 VPNGate 列表重新积累。
+- 拉节点列表可以走代理：在 `compose.yaml` 的 `environment` 里加 `HTTPS_PROXY` 和 `HTTP_PROXY`（支持 `http://`、`socks5://`），只用于拉列表，隧道流量不受影响。
 
 容器需要 `NET_ADMIN` 和 `/dev/net/tun`；隧道、策略路由和 `rp_filter` 都在容器自己的网络命名空间里，不改宿主路由。镜像由 `.github/workflows/docker.yml` 在 "Go native gateway" 测试通过后，分别在 x86_64 和 arm64 原生 runner 上构建，合并成多架构镜像推送到 `ghcr.io/limlll/vpngate-proxy`；推 `v*` 标签会额外发布对应版本号。
 
@@ -85,7 +85,7 @@ sudo vpngate-proxy --data-dir ./vpngate_data
 | --- | --- |
 | `go_backend/core` | OpenVPN 3 Core 的 Go 封装 |
 | `go_backend/gateway` | 用户名解析、隧道池（按需连接与即时关闭、按实测出口 IP 分配与轮换、会话粘滞/TTL、健康检查）、HTTP/SOCKS5 代理 |
-| `go_backend/nodes` | VPNGate CSV 与 profile 校验、累计节点表（含测活结果、各节点出口 IP，及各网段、各出口的最近使用时间）、握手测活、挑节点顺序、API 拉取 |
+| `go_backend/nodes` | VPNGate CSV 与 profile 校验、累计节点表（含各节点出口 IP，及各网段、各出口的最近使用时间）、挑节点顺序、API 拉取 |
 | `go_backend/cmd/vpngate-proxy` | 主程序与配置 |
 | `go_backend/cmd/{bench,probe,candidate,testserver,testauth}` | 基准、真实节点探针与 CI 测试辅助程序 |
 

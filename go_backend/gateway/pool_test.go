@@ -115,9 +115,6 @@ func testNodes(t *testing.T, countries ...string) *nodes.Registry {
 	if _, err := registry.Merge(listing, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	for _, candidate := range listing {
-		registry.ReportProbe(candidate.ID, true, time.Now())
-	}
 	return registry
 }
 
